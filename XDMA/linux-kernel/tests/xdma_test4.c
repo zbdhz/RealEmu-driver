@@ -84,6 +84,9 @@ void set_bits(uint8_t* buffer, size_t start_bit, size_t num_bits, uint64_t value
 void direct_reverse_mac_bridge_to_buffer(const MacBridge_TOP* data, uint8_t* buffer) {
     size_t bit_pos = 0;
     // 从最低位开始反向设置
+    set_bits(buffer, bit_pos, 7, data->bridgeTag.notUsed);
+    bit_pos += 7;
+    set_bit(buffer, bit_pos++, data->bridgeTag.control);
     set_bit(buffer, bit_pos++, data->macEvent.status);
     set_bits(buffer, bit_pos, 64, data->macEvent.mpduDigest.mpducacheaddr);
     bit_pos += 64;
@@ -103,22 +106,19 @@ void direct_reverse_mac_bridge_to_buffer(const MacBridge_TOP* data, uint8_t* buf
     bit_pos += 10;
     set_bits(buffer, bit_pos, 10, data->macEvent.srcMacId);
     bit_pos += 10;
-    set_bits(buffer, bit_pos, 7, data->bridgeTag.notUsed);
-    bit_pos += 7;
-    set_bit(buffer, bit_pos++, data->bridgeTag.control);
 }
 void direct_reverse_cfg_bridge_to_buffer(const CfgBridge_TOP* data, uint8_t* buffer) {
     size_t bit_pos = 0;
     // 从最低位开始反向设置
+    set_bits(buffer, bit_pos, 1, data->bridgeTag.notUsed);
+    bit_pos += 7;
+    set_bit(buffer, bit_pos++, data->bridgeTag.control);
     set_bits(buffer, bit_pos, 10, data->channelCfg.distance);
     bit_pos += 10;    
     set_bits(buffer, bit_pos, 10, data->channelCfg.dstPhyId);
     bit_pos += 10;
     set_bits(buffer, bit_pos, 10, data->channelCfg.srcPhyId);
     bit_pos += 10;
-    set_bits(buffer, bit_pos, 1, data->bridgeTag.notUsed);
-    bit_pos += 7;
-    set_bit(buffer, bit_pos++, data->bridgeTag.control);
 }
 void print_byte_in_binary(uint8_t byte) {
     for (int i = 7; i >= 0; i--) {
@@ -284,7 +284,7 @@ int main() {
         .channelCfg = {
             .srcPhyId = 0,   // 源物理ID为0
             .dstPhyId = 1,   // 目标物理ID为1
-            .distance = 10    // 距离设为10
+            .distance = 8    // 距离设为10
         }
     };
     uint8_t buffer[BUFFER_SIZE] = {0};
