@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
+#define BUFFER_SIZE 64
 // 定义与Bluespec结构体对齐的数据结构
 #pragma pack(push, 1) // 禁用内存对齐，确保与FPGA侧严格匹配
 
@@ -62,10 +63,6 @@ typedef struct {
 
 #pragma pack(pop) // 恢复默认对齐
 
-
-#define BUFFER_SIZE 64
-#define SNED_DELTA_TIME 10
-#define SEND_NUM 1000
 
 // 按照字节设置缓冲区中指定位置的位
 void set_bit(uint8_t* buffer, size_t bit_pos, uint8_t value) {
@@ -266,9 +263,94 @@ void print_current_time() {
 #define DEVICE_H2C "/dev/xdma0_h2c_0" // Host-to-Card 通道设备文件
 #define DEVICE_C2H "/dev/xdma0_c2h_0" // Card-to-Host 通道设备文件
 #define BURST_SIZE 1
+#define TEST_MCS 0              // MCS值 (0-7)
+#define TEST_POWER_START -32      // 起始功率值
+#define TEST_POWER_STEP 4         // 功率步进值
+#define TEST_POWER_STEPS 16       // 功率步进次数
+#define PACKETS_PER_STEP 100     // 每个功率点的测试包数
+
+// 执行单个功率点的测试
+int run_single_test(int h2c_fd, int c2h_fd, uint8_t* tx_buf, uint8_t* rx_buf, size_t buf_size, int mcs, int power, int packet_count) {
+    int received_count = 0;
+    
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        perror("pipe failed");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    
+    if (pid == 0) {
+        // 子进程：接收数据
+        close(pipefd[0]); // 子进程关闭读端
+        MacBridge_TOP *event = (MacBridge_TOP*)malloc(sizeof(MacBridge_TOP));
+        if (!event) {
+            perror("内存分配失败");
+            exit(EXIT_FAILURE);
+        }
+        
+        while (received_count < packet_count) {
+            ssize_t read_bytes = read(c2h_fd, rx_buf, buf_size);
+            if (read_bytes <= 0) {
+                break; //发送完成 && 长时间未接收到数据，则退出循环
+            }
+            
+            buffer_to_mac_bridge(rx_buf, event);
+            received_count++;
+
+        }
+        
+        free(event);
+        printf("MCS=%d, Power=%d: 接收 %d/%d 包\n", mcs, power-578, received_count, packet_count);
+        // ✅ 把真实接收包数写入管道
+        if (write(pipefd[1], &received_count, sizeof(received_count)) != sizeof(received_count)) {
+            perror("pipe write failed");
+        }
+        close(pipefd[1]);
+        exit(0); // 退出子进程
+
+    } else if (pid > 0) {
+        // 父进程：发送数据
+        sleep(1); // 确保子进程已就绪
+        
+        for (int i = 0; i < packet_count; i++) {
+            ssize_t written = write(h2c_fd, tx_buf, buf_size);
+            if (written < 0) {
+                perror("H2C write failed");
+                break;
+            }
+            usleep(1000); // 1ms延迟
+        }
+        int status;
+        waitpid(pid, &status, 0);
+
+        int received_total = 0;
+        if (WIFEXITED(status)) {
+            // 从管道读取真实接收包数
+            if (read(pipefd[0], &received_total, sizeof(received_total)) == sizeof(received_total)) {
+                close(pipefd[0]);
+                return received_total;
+            } else {
+                perror("pipe read failed");
+            }
+        }
+        close(pipefd[0]);
+        return -1; // 出错
+    }
+}
 
 
 int main() {
+    // 打印测试配置 
+    printf("=== 丢包测试配置 ===\n");
+    printf("MCS值: %d\n", TEST_MCS);
+    printf("起始功率: %d\n", TEST_POWER_START);
+    printf("功率步进: %d\n", TEST_POWER_STEP);
+    printf("功率步进次数: %d\n", TEST_POWER_STEPS);
+    printf("每个功率点测试包数: %d\n", PACKETS_PER_STEP);
+    printf("===================\n\n");
+
     int h2c_fd = open(DEVICE_H2C, O_RDWR); // 打开 H2C 设备
     int c2h_fd = open(DEVICE_C2H, O_RDWR); // 打开 C2H 设备
 
@@ -276,11 +358,13 @@ int main() {
         perror("Failed to open XDMA device");
         return -1;
     }
-    printf("open success!\n");
+    printf("XDMA设备打开成功!\n");
+
     // 修改缓冲区分配和初始化
     size_t buf_size = 64; 
     uint8_t *rx_buf = (uint8_t*)aligned_alloc(4096, buf_size); // 使用更大的对齐
     uint8_t *tx_buf = (uint8_t*)aligned_alloc(4096, buf_size); // 改为uint8_t类型
+
     if (!rx_buf || !tx_buf) {
         perror("Memory allocation failed");
         close(h2c_fd);
@@ -288,29 +372,6 @@ int main() {
         return -1;
     }
     memset(tx_buf, 0, buf_size);
-    // 创建 MacBridge_TOP 格式的数据
-    MacBridge_TOP bridge_data = {
-        .bridgeTag = {
-            .control = 0,    // 控制标志设为0，表示这是一个MacEvent //66
-            .notUsed = 0     // 未使用位清零 //67
-        },
-        .macEvent = {
-            .srcMacId = 63,   // 源MAC ID //74
-            .dstMacId = 0,   // 目标MAC ID设为1 //84
-            .rfParam = {
-                .power = 578 + 32*2,  // 功率设为最大值 //98
-                .mcs = 0       // MCS设为0 //110
-            },
-            .mpduDigest = {
-                .frametype = 2,     // 帧w类型
-                .framesubtype = 0,  // 帧子类型
-                .duration = 0,      // 持续时间
-                .mpdulen = 1,        // 长度
-                .mpducacheaddr = 0      // 缓存地址
-            },
-            .status = 0,        // 状态
-        }
-    };
 
     // 创建 CfgBridge_TOP 格式的数据，用于配置节点0和节点1之间的距离为1
     CfgBridge_TOP cfg_bridge_data = {
@@ -324,16 +385,23 @@ int main() {
             .distance = 8    // 距离设为10
         }
     };
-    uint8_t buffer[BUFFER_SIZE] = {0};
-    direct_reverse_mac_bridge_to_buffer(&bridge_data, buffer);
-    // direct_reverse_cfg_bridge_to_buffer(&cfg_bridge_data, buffer);
-    
-    // print_buffer_in_binary(buffer,64);
-    memcpy(tx_buf, &buffer, sizeof(buffer)); // 将数据复制到tx_buf
-    
-    // 确保结构体大小与传输大小匹配
-    if (sizeof(MacEvent) > buf_size) {
-        printf("MacEvent size %zu exceeds buffer size %zu\n", sizeof(MacEvent), buf_size);
+
+    uint8_t cfg_buffer[BUFFER_SIZE] = {0};
+    direct_reverse_cfg_bridge_to_buffer(&cfg_bridge_data, cfg_buffer);
+    memcpy(tx_buf, cfg_buffer, sizeof(cfg_buffer));
+    ssize_t cfg_written = write(h2c_fd, tx_buf, buf_size);
+    if (cfg_written < 0) {
+        perror("信道配置发送失败");
+    } else {
+        printf("信道配置发送成功\n");
+    }
+    sleep(1); // 等待配置生效
+
+
+    // 测试结果数组
+    int* received_counts = malloc(TEST_POWER_STEPS * sizeof(int));
+    if (!received_counts) {
+        perror("内存分配失败");
         close(h2c_fd);
         close(c2h_fd);
         free(tx_buf);
@@ -341,63 +409,53 @@ int main() {
         return -1;
     }
 
-        // 通过 C2H 通道接收数据
-	if (fork() == 0) {
-        printf("接收进程启动, PID: %d\n", getpid());
 
-        int received_count = 0;
-        MacBridge_TOP *event = (MacBridge_TOP*)malloc(sizeof(MacBridge_TOP));
-        while(received_count < SEND_NUM)
-            {
-                ssize_t read_bytes = read(c2h_fd, rx_buf, buf_size);
-                if (read_bytes <= 0) {
-                    printf("读取失败或连接关闭，退出接收进程\n");
-                    break;
-                }
-                ++received_count;
-                if(received_count%1==0)
-                {
-                    printf("Received %zd bytes from FPGA, total Received: %d \n", read_bytes, received_count);
-                    print_current_time();
-                }
-                buffer_to_mac_bridge(rx_buf, event);
-                // printf("  MacEvent data:\n");
-                // printf("  srcMacId: 0x%x\n", event->macEvent.srcMacId);
-                // printf("  dstMacId: 0x%x\n", event->macEvent.dstMacId);
-                printf("  rfParam.power: %u\n", event->macEvent.rfParam.power);
-                // printf("  rfParam.mcs: %u\n", event->macEvent.rfParam.mcs);
-                // printf("  mpduDigest.frametype: %u\n", event->macEvent.mpduDigest.frametype);
-                // printf("  mpduDigest.mpducacheaddr: 0x%lx\n", event->macEvent.mpduDigest.mpducacheaddr);
+    // 执行不同功率下的测试
+    for (int step = 0; step < TEST_POWER_STEPS; step++) {
+        int current_power = TEST_POWER_START + step * TEST_POWER_STEP + 578;
+        
+        printf("开始测试: MCS=%d, Power=%d\n", TEST_MCS, current_power);
+        
+        // 创建测试数据
+        MacBridge_TOP bridge_data = {
+            .bridgeTag = {
+                .control = 0,
+                .notUsed = 0
+            },
+            .macEvent = {
+                .srcMacId = 0,
+                .dstMacId = 1,
+                .rfParam = {
+                    .power = current_power,
+                    .mcs = TEST_MCS
+                },
+                .mpduDigest = {
+                    .frametype = 2,
+                    .framesubtype = 0,
+                    .duration = 0,
+                    .mpdulen = 1,
+                    .mpducacheaddr = 0
+                },
+                .status = 0
             }
-        free(event);
-        return 0;
-        }
-    else {
-        sleep(1);  // 确保子进程的 read 已就绪
-        printf("发送进程启动, PID: %d\n", getpid());
-        for(int i=0;i<SEND_NUM;i++){
-            ssize_t written = write(h2c_fd, tx_buf, buf_size);
-
-        if (written < 0) {
-            perror("H2C write failed");
-            printf("Error details: %s\n", strerror(errno));
-            break;
-        } else {
-            if(i%1==0)
-            {
-                // printf("Pkt_id:%d, total_pkt: %d,Sent %zd bytes to FPGA\n",i,SEND_NUM, written);
-                // print_current_time();
-
-            }
-            // printf("Pkt_id:%d, total_pkt: %d,Sent %zd bytes to FPGA\n",i,SEND_NUM, written);
-        }
-        usleep(1000);
-        }
-        printf("发送进程完成，等待接收进程结束...\n");
-        int status;
-        wait(&status);  // 等待子进程结束
-        sleep(1);
-    }	
+        };
+        
+        // 序列化数据
+        uint8_t buffer[BUFFER_SIZE] = {0};
+        direct_reverse_mac_bridge_to_buffer(&bridge_data, buffer);
+        memcpy(tx_buf, buffer, sizeof(buffer));
+        
+        // 执行测试
+        received_counts[step] = run_single_test(h2c_fd, c2h_fd, tx_buf, rx_buf, 
+                                              buf_size, TEST_MCS, current_power, 
+                                              PACKETS_PER_STEP);
+        
+        // 计算丢包率
+        float loss_rate = (1.0 - (float)received_counts[step] / PACKETS_PER_STEP) * 100.0;
+        printf("结果: MCS=%d, Power=%d, 接收=%d/%d, 丢包率=%.2f%%\n\n", 
+               TEST_MCS, current_power-578, received_counts[step], 
+               PACKETS_PER_STEP, loss_rate);
+    }
         
     // 验证数据一致性
     close(h2c_fd);
