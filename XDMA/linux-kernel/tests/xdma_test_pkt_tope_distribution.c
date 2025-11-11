@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <ctype.h>
 
 // 定义与Bluespec结构体对齐的数据结构
 #pragma pack(push, 1) // 禁用内存对齐，确保与FPGA侧严格匹配
@@ -64,8 +65,6 @@ typedef struct {
 
 
 #define BUFFER_SIZE 64
-#define SNED_DELTA_TIME 10
-#define SEND_NUM 1000
 
 // 按照字节设置缓冲区中指定位置的位
 void set_bit(uint8_t* buffer, size_t bit_pos, uint8_t value) {
@@ -263,147 +262,240 @@ void print_current_time() {
            tv.tv_usec);
 }
 
+// CSV数据结构体
+typedef struct {
+    int time_sec;       // 时刻（秒数）
+    int src_id;         // 源ID
+    int dst_id;         // 目的ID
+    int distance;       // 距离
+} CsvChannelConfig;
+
+/**
+ * @brief 从CSV文件中读取特定秒数的信道配置数据
+ * @param file_path CSV文件路径
+ * @param target_sec 要读取的目标秒数
+ * @param configs 输出参数，存储读取到的配置数据
+ * @param max_configs 最大配置数量
+ * @return 实际读取到的配置数量，-1表示错误
+ */
+int read_csv_configs_for_second(const char* file_path, int target_sec, 
+                               CsvChannelConfig* configs, int max_configs) {
+    FILE* file = fopen(file_path, "r");
+    if (!file) {
+        perror("无法打开CSV文件");
+        return -1;
+    }
+    
+    char line[256];
+    int count = 0;
+    
+    // 跳过标题行（如果有）
+    if (fgets(line, sizeof(line), file) == NULL) {
+        fclose(file);
+        return 0;
+    }
+    
+    // 检查是否是标题行（包含非数字字符）
+    int is_header = 0;
+    char* token = strtok(line, ",");
+    if (token && !isdigit(token[0])) {
+        is_header = 1;
+    }
+    
+    // 如果不是标题行，需要重置文件指针并处理第一行数据
+    if (!is_header) {
+        rewind(file);
+    }
+    
+    // 逐行读取CSV文件
+    while (fgets(line, sizeof(line), file) != NULL && count < max_configs) {
+        int time_sec, src_id, dst_id, distance;
+        
+        // 解析CSV行
+        if (sscanf(line, "%d,%d,%d,%d", &time_sec, &src_id, &dst_id, &distance) == 4) {
+            // 检查是否是目标秒数
+            if (time_sec == target_sec) {
+                configs[count].time_sec = time_sec;
+                configs[count].src_id = src_id;
+                configs[count].dst_id = dst_id;
+                configs[count].distance = distance;
+                count++;
+            }else{
+                // break;
+            }
+        }
+    }
+    
+    fclose(file);
+    return count;
+}
+
+/**
+ * @brief 下发信道配置到FPGA
+ * @param h2c_fd H2C设备文件描述符
+ * @param configs 信道配置数组
+ * @param config_count 配置数量
+ * @param tx_buf 发送缓冲区
+ * @param buf_size 缓冲区大小
+ * @return 成功下发的配置数量，-1表示错误
+ */
+int send_channel_configs(int h2c_fd, const CsvChannelConfig* configs, 
+                        int config_count, uint8_t* tx_buf, size_t buf_size) {
+    int success_count = 0;
+    
+    for (int i = 0; i < config_count; i++) {
+        // 创建 CfgBridge_TOP 格式的数据
+        CfgBridge_TOP cfg_bridge_data = {
+            .bridgeTag = {
+                .control = 1,    // 控制标志设为1，表示这是一个配置消息
+                .notUsed = 127   // 未使用位清零
+            },
+            .channelCfg = {
+                .srcPhyId = configs[i].src_id,   // 源物理ID
+                .dstPhyId = configs[i].dst_id,   // 目标物理ID
+                .distance = configs[i].distance  // 距离
+            }
+        };
+        
+        // 序列化数据
+        uint8_t cfg_buffer[BUFFER_SIZE] = {0};
+        direct_reverse_cfg_bridge_to_buffer(&cfg_bridge_data, cfg_buffer);
+        memcpy(tx_buf, cfg_buffer, sizeof(cfg_buffer));
+        
+        // 发送配置
+        ssize_t written = write(h2c_fd, tx_buf, buf_size);
+        if (written < 0) {
+            perror("信道配置发送失败");
+            printf("配置 %d (src=%d, dst=%d, distance=%d) 发送失败\n", 
+                   i, configs[i].src_id, configs[i].dst_id, configs[i].distance);
+        } else {
+            printf("配置 %d (src=%d, dst=%d, distance=%d) 发送成功\n", 
+                   i, configs[i].src_id, configs[i].dst_id, configs[i].distance);
+            success_count++;
+        }
+        
+        // 短暂延迟，确保配置被处理
+        usleep(100);  // 0.1m实测可用
+    }
+    
+    return success_count;
+}
+
+/**
+ * @brief 处理CSV文件中的信道配置
+ * @param file_path CSV文件路径
+ * @param h2c_fd H2C设备文件描述符
+ * @param tx_buf 发送缓冲区
+ * @param buf_size 缓冲区大小
+ * @param start_sec 开始处理的秒数
+ * @param end_sec 结束处理的秒数
+ * @return 成功处理的配置总数，-1表示错误
+ */
+int process_csv_configs(const char* file_path, int h2c_fd, 
+                       uint8_t* tx_buf, size_t buf_size,
+                       int start_sec, int end_sec) {
+    int total_success = 0;
+    
+    // 为每个秒数分配配置数组
+    CsvChannelConfig* configs = malloc(100 * sizeof(CsvChannelConfig));  // 假设每秒最多100个配置
+    
+    if (!configs) {
+        perror("内存分配失败");
+        return -1;
+    }
+    
+    // 逐秒处理配置
+    for (int sec = start_sec; sec <= end_sec; sec++) {
+        printf("\n=== 处理第 %d 秒的配置 ===\n", sec);
+        
+        // 读取当前秒的配置
+        int config_count = read_csv_configs_for_second(file_path, sec, configs, 100);
+        
+        if (config_count < 0) {
+            printf("读取第 %d 秒的配置失败\n", sec);
+            free(configs);
+            return -1;
+        } else if (config_count == 0) {
+            printf("第 %d 秒没有配置数据\n", sec);
+            continue;
+        }
+        
+        printf("读取到 %d 个配置\n", config_count);
+        
+        // 发送配置
+        int success_count = send_channel_configs(h2c_fd, configs, config_count, tx_buf, buf_size);
+        
+        if (success_count < 0) {
+            printf("发送第 %d 秒的配置失败\n", sec);
+            free(configs);
+            return -1;
+        }
+        
+        total_success += success_count;
+        printf("第 %d 秒的配置处理完成，成功发送 %d/%d 个配置\n", sec, success_count, config_count);
+        
+        // 等待配置生效
+        sleep(1);
+    }
+    
+    free(configs);
+    return total_success;
+}
+
 #define DEVICE_H2C "/dev/xdma0_h2c_0" // Host-to-Card 通道设备文件
 #define DEVICE_C2H "/dev/xdma0_c2h_0" // Card-to-Host 通道设备文件
 #define BURST_SIZE 1
 
+// #define CSV_FILE_PATH "channel_config.csv"  // 修改为您的CSV文件路径
+// #define START_SECOND 1                            // 修改为开始处理的秒数
+// #define END_SECOND 1                             // 修改为结束处理的秒数
+// #define MAX_CONFIGS_PER_SECOND 200               // 修改为每秒最大配置数量
+
+#define CSV_FILE_PATH "channel_config.csv"
+#define START_SECOND 1
+#define END_SECOND 1
+#define MAX_CONFIGS_PER_SECOND 56
 
 int main() {
-    int h2c_fd = open(DEVICE_H2C, O_RDWR); // 打开 H2C 设备
-    int c2h_fd = open(DEVICE_C2H, O_RDWR); // 打开 C2H 设备
+    printf("=== 信道配置程序 ===\n");
+    printf("CSV文件路径: %s\n", CSV_FILE_PATH);
+    printf("处理秒数范围: %d-%d\n", START_SECOND, END_SECOND);
+    printf("===================\n\n");
 
-    if (h2c_fd < 0 || c2h_fd < 0) {
+    int h2c_fd = open(DEVICE_H2C, O_RDWR); // 打开 H2C 设备
+    // int c2h_fd = open(DEVICE_C2H, O_RDWR); // 打开 C2H 设备
+
+    if (h2c_fd < 0) {
         perror("Failed to open XDMA device");
         return -1;
     }
     printf("open success!\n");
     // 修改缓冲区分配和初始化
     size_t buf_size = 64; 
-    uint8_t *rx_buf = (uint8_t*)aligned_alloc(4096, buf_size); // 使用更大的对齐
+    // uint8_t *rx_buf = (uint8_t*)aligned_alloc(4096, buf_size); // 使用更大的对齐
     uint8_t *tx_buf = (uint8_t*)aligned_alloc(4096, buf_size); // 改为uint8_t类型
-    if (!rx_buf || !tx_buf) {
+    if (!tx_buf) {
         perror("Memory allocation failed");
         close(h2c_fd);
-        close(c2h_fd);
+        // close(c2h_fd);
         return -1;
     }
     memset(tx_buf, 0, buf_size);
-    // 创建 MacBridge_TOP 格式的数据
-    MacBridge_TOP bridge_data = {
-        .bridgeTag = {
-            .control = 0,    // 控制标志设为0，表示这是一个MacEvent //66
-            .notUsed = 0     // 未使用位清零 //67
-        },
-        .macEvent = {
-            .srcMacId = 63,   // 源MAC ID //74
-            .dstMacId = 0,   // 目标MAC ID设为1 //84
-            .rfParam = {
-                .power = 578 + 32*2,  // 功率设为最大值 //98
-                .mcs = 0       // MCS设为0 //110
-            },
-            .mpduDigest = {
-                .frametype = 2,     // 帧w类型
-                .framesubtype = 0,  // 帧子类型
-                .duration = 0,      // 持续时间
-                .mpdulen = 1,        // 长度
-                .mpducacheaddr = 0      // 缓存地址
-            },
-            .status = 0,        // 状态
-        }
-    };
-
-    // 创建 CfgBridge_TOP 格式的数据，用于配置节点0和节点1之间的距离为1
-    CfgBridge_TOP cfg_bridge_data = {
-        .bridgeTag = {
-            .control = 1,    // 控制标志设为1，表示这是一个配置消息
-            .notUsed = 127    // 未使用位清零
-        },
-        .channelCfg = {
-            .srcPhyId = 0,   // 源物理ID为0
-            .dstPhyId = 1,   // 目标物理ID为1
-            .distance = 8    // 距离设为10
-        }
-    };
-    uint8_t buffer[BUFFER_SIZE] = {0};
-    direct_reverse_mac_bridge_to_buffer(&bridge_data, buffer);
-    // direct_reverse_cfg_bridge_to_buffer(&cfg_bridge_data, buffer);
+        // 处理CSV配置
+    int total_configs = process_csv_configs(CSV_FILE_PATH, h2c_fd, tx_buf, buf_size, 
+                                          START_SECOND, END_SECOND);
     
-    // print_buffer_in_binary(buffer,64);
-    memcpy(tx_buf, &buffer, sizeof(buffer)); // 将数据复制到tx_buf
-    
-    // 确保结构体大小与传输大小匹配
-    if (sizeof(MacEvent) > buf_size) {
-        printf("MacEvent size %zu exceeds buffer size %zu\n", sizeof(MacEvent), buf_size);
-        close(h2c_fd);
-        close(c2h_fd);
-        free(tx_buf);
-        free(rx_buf);
-        return -1;
+    if (total_configs >= 0) {
+        printf("\n配置处理完成, 总共成功发送 %d 个配置\n", total_configs);
+    } else {
+        printf("\n配置处理失败\n");
     }
 
-        // 通过 C2H 通道接收数据
-	if (fork() == 0) {
-        printf("接收进程启动, PID: %d\n", getpid());
-
-        int received_count = 0;
-        MacBridge_TOP *event = (MacBridge_TOP*)malloc(sizeof(MacBridge_TOP));
-        while(received_count < SEND_NUM)
-            {
-                ssize_t read_bytes = read(c2h_fd, rx_buf, buf_size);
-                if (read_bytes <= 0) {
-                    printf("读取失败或连接关闭，退出接收进程\n");
-                    break;
-                }
-                ++received_count;
-                if(received_count%1==0)
-                {
-                    printf("Received %zd bytes from FPGA, total Received: %d \n", read_bytes, received_count);
-                    print_current_time();
-                }
-                buffer_to_mac_bridge(rx_buf, event);
-                // printf("  MacEvent data:\n");
-                // printf("  srcMacId: 0x%x\n", event->macEvent.srcMacId);
-                // printf("  dstMacId: 0x%x\n", event->macEvent.dstMacId);
-                printf("  rfParam.power: %u\n", event->macEvent.rfParam.power);
-                // printf("  rfParam.mcs: %u\n", event->macEvent.rfParam.mcs);
-                // printf("  mpduDigest.frametype: %u\n", event->macEvent.mpduDigest.frametype);
-                // printf("  mpduDigest.mpducacheaddr: 0x%lx\n", event->macEvent.mpduDigest.mpducacheaddr);
-            }
-        free(event);
-        return 0;
-        }
-    else {
-        sleep(1);  // 确保子进程的 read 已就绪
-        printf("发送进程启动, PID: %d\n", getpid());
-        for(int i=0;i<SEND_NUM;i++){
-            ssize_t written = write(h2c_fd, tx_buf, buf_size);
-
-        if (written < 0) {
-            perror("H2C write failed");
-            printf("Error details: %s\n", strerror(errno));
-            break;
-        } else {
-            if(i%1==0)
-            {
-                // printf("Pkt_id:%d, total_pkt: %d,Sent %zd bytes to FPGA\n",i,SEND_NUM, written);
-                // print_current_time();
-
-            }
-            // printf("Pkt_id:%d, total_pkt: %d,Sent %zd bytes to FPGA\n",i,SEND_NUM, written);
-        }
-        usleep(1000);
-        }
-        printf("发送进程完成，等待接收进程结束...\n");
-        int status;
-        wait(&status);  // 等待子进程结束
-        sleep(1);
-    }	
-        
-    // 验证数据一致性
+    //清理资源
     close(h2c_fd);
-    close(c2h_fd);
+    // close(c2h_fd);
     free(tx_buf);
-    free(rx_buf);
+    // free(rx_buf);
     
     return 0;
 }

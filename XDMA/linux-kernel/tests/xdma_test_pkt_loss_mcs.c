@@ -264,10 +264,11 @@ void print_current_time() {
 #define DEVICE_C2H "/dev/xdma0_c2h_0" // Card-to-Host 通道设备文件
 #define BURST_SIZE 1
 #define TEST_MCS 0              // MCS值 (0-7)
-#define TEST_POWER_START -32      // 起始功率值
+#define TEST_POWER_START -32 + 64     // 起始功率值
 #define TEST_POWER_STEP 4         // 功率步进值
-#define TEST_POWER_STEPS 16       // 功率步进次数
-#define PACKETS_PER_STEP 100     // 每个功率点的测试包数
+#define TEST_POWER_STEPS 1       // 功率步进次数
+#define PACKETS_PER_STEP 1000     // 每个功率点的测试包数
+#define SEND_DELTA_TIME 500 //us     
 
 // 执行单个功率点的测试
 int run_single_test(int h2c_fd, int c2h_fd, uint8_t* tx_buf, uint8_t* rx_buf, size_t buf_size, int mcs, int power, int packet_count) {
@@ -320,7 +321,7 @@ int run_single_test(int h2c_fd, int c2h_fd, uint8_t* tx_buf, uint8_t* rx_buf, si
                 perror("H2C write failed");
                 break;
             }
-            usleep(1000); // 1ms延迟
+            usleep(SEND_DELTA_TIME); // 1ms延迟
         }
         int status;
         waitpid(pid, &status, 0);
