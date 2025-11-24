@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/stat.h>  // 用于chmod函数和权限常量
+#include <grp.h>       // 用于getgrnam函数
 
 // 定义与Bluespec结构体对齐的数据结构
 #pragma pack(push, 1) // 禁用内存对齐，确保与FPGA侧严格匹配
@@ -66,23 +68,22 @@ typedef struct {
 #define BUFFER_SIZE 64
 #define DEVICE_H2C "/dev/xdma0_h2c_0" // Host-to-Card 通道设备文件
 #define DEVICE_C2H "/dev/xdma0_c2h_0" // Card-to-Host 通道设备文件
-#define SEND_DELTA_TIME 500
-#define SEND_NUM 1000
+
+#define SEND_DELTA_TIME 100
+#define SEND_NUM 10000
+
 
 // 测试参数配置
-#define DISTURB_RATE_MIN 0
-#define DISTURB_RATE_MAX 100
-#define DISTURB_RATE_STEP 10
-#define DISTURB_POWER_MIN 0
-#define DISTURB_POWER_MAX 100
-#define DISTURB_POWER_STEP 10
+#define SEND_TOTAL_NUM_MIN 1
+#define SEND_TOTAL_NUM_MAX 63
+#define SEND_TOTAL_NUM_STEP 1
 
 // 测试结果结构体
 typedef struct {
-    int disturb_rate;
-    int disturb_power;
+    int send_total_num;
     int received_packets;
 } TestResult;
+
 
 // 按照字节设置缓冲区中指定位置的位
 void set_bit(uint8_t* buffer, size_t bit_pos, uint8_t value) {
@@ -281,12 +282,11 @@ void print_current_time() {
 }
 
 /**
- * @brief 执行单个测试点的测试
- * @param disturb_rate 干扰率 (0-100)
- * @param disturb_power 干扰功率
+ * @brief 执行单个测试点的测试（修复版本）
+ * @param send_total_num 发包节点数
  * @return 接收到的包数，-1表示测试失败
  */
-int run_single_test(int disturb_rate, int disturb_power) {
+int run_single_test(int send_total_num) {
     int h2c_fd = open(DEVICE_H2C, O_RDWR);
     int c2h_fd = open(DEVICE_C2H, O_RDWR);
 
@@ -298,16 +298,14 @@ int run_single_test(int disturb_rate, int disturb_power) {
     size_t buf_size = 64;
     uint8_t *rx_buf = (uint8_t*)aligned_alloc(4096, buf_size);
     uint8_t *tx_buf1 = (uint8_t*)aligned_alloc(4096, buf_size);
-    uint8_t *tx_buf2 = (uint8_t*)aligned_alloc(4096, buf_size);
 
-    if (!rx_buf || !tx_buf1 || !tx_buf2) {
+    if (!rx_buf || !tx_buf1) {
         perror("Memory allocation failed");
         close(h2c_fd);
         close(c2h_fd);
         return -1;
     }
     memset(tx_buf1, 0, buf_size);
-    memset(tx_buf2, 0, buf_size);
 
     // 创建主数据包
     MacBridge_TOP bridge_data1 = {
@@ -319,7 +317,7 @@ int run_single_test(int disturb_rate, int disturb_power) {
             .srcMacId = 1,
             .dstMacId = 0,
             .rfParam = {
-                .power = 50 + 578,
+                .power = 5*32 + 578,
                 .mcs = 0
             },
             .mpduDigest = {
@@ -332,35 +330,6 @@ int run_single_test(int disturb_rate, int disturb_power) {
             .status = 0,
         }
     };
-
-    // 创建干扰包
-    MacBridge_TOP bridge_data2 = {
-        .bridgeTag = {
-            .control = 0,
-            .notUsed = 0
-        },
-        .macEvent = {
-            .srcMacId = 2,
-            .dstMacId = 0,
-            .rfParam = {
-                .power = disturb_power + 578,
-                .mcs = 0
-            },
-            .mpduDigest = {
-                .frametype = 2,
-                .framesubtype = 0,
-                .duration = 0,
-                .mpdulen = 256,
-                .mpducacheaddr = 0
-            },
-            .status = 0,
-        }
-    };
-
-    // 准备干扰包数据
-    uint8_t buffer2[BUFFER_SIZE] = {0};
-    direct_reverse_mac_bridge_to_buffer(&bridge_data2, buffer2);
-    memcpy(tx_buf2, &buffer2, sizeof(buffer2));
 
     int pipefd[2];
     if (pipe(pipefd) == -1) {
@@ -368,7 +337,6 @@ int run_single_test(int disturb_rate, int disturb_power) {
         close(h2c_fd);
         close(c2h_fd);
         free(tx_buf1);
-        free(tx_buf2);
         free(rx_buf);
         return -1;
     }
@@ -376,85 +344,169 @@ int run_single_test(int disturb_rate, int disturb_power) {
     pid_t pid = fork();
     
     if (pid == 0) {
-        // 子进程：接收数据
+        // 子进程：接收数据（修复版本）
         close(pipefd[0]); // 关闭读端
-        printf("接收进程启动, PID: %d, disturb_rate=%d, disturb_power=%d\n", 
-               getpid(), disturb_rate, disturb_power);
+        printf("接收进程启动, PID: %d, send_total_num=%d\n", 
+               getpid(), send_total_num);
 
         int received_count = 0;
+        int time_window_count = 0; // 统计时间窗口内的包数
         MacBridge_TOP *event = (MacBridge_TOP*)malloc(sizeof(MacBridge_TOP));
-        int seq_num = -1;
+        
+        int seq_num[64];
+        // 初始化序列号数组为-1
+        for (int i = 0; i < 64; i++) {
+            seq_num[i] = -1;
+        }
+        
+        struct timeval start_time, current_time;
+        int time_window_started = 0; // 时间窗口开始标志
+        int time_window_ended = 0;   // 时间窗口结束标志
+        
+        // 获取开始时间
+        gettimeofday(&start_time, NULL);
         
         while(1) {
+            // 获取当前时间
+            gettimeofday(&current_time, NULL);
+            
+            // 计算经过的时间（秒）
+            long elapsed_seconds = current_time.tv_sec - start_time.tv_sec;
+            long elapsed_microseconds = current_time.tv_usec - start_time.tv_usec;
+            double elapsed_total = elapsed_seconds + elapsed_microseconds / 1000000.0;
+            
+            // 检查是否进入时间窗口（第1秒到第2秒）
+            if (!time_window_started && elapsed_total >= 1.0) {
+                time_window_started = 1;
+                printf("进入时间窗口: 开始统计第1-2秒的包数\n");
+            }
+            
+            // 检查是否超出时间窗口
+            if (time_window_started && !time_window_ended && elapsed_total >= 2.0) {
+                time_window_ended = 1;
+                printf("时间窗口结束: 第1-2秒内接收到 %d 个包\n", time_window_count);
+                // sleep(1);
+                // break; // 时间窗口结束，退出接收循环
+            }
+            
             ssize_t read_bytes = read(c2h_fd, rx_buf, buf_size);
             if (read_bytes <= 0) {
+                // 非阻塞读取，如果没有数据则继续
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000); // 等待1ms
+                    continue;
+                }
                 printf("读取失败或连接关闭，退出接收进程\n");
                 break;
             }
             
             buffer_to_mac_bridge(rx_buf, event);
-            if(event->macEvent.srcMacId == 1 && (int)event->macEvent.mpduDigest.mpducacheaddr > seq_num) {
-                seq_num = event->macEvent.mpduDigest.mpducacheaddr;
-                ++received_count;
+            int srcMacId = event->macEvent.srcMacId;
+            if ((int)event->macEvent.mpduDigest.mpducacheaddr > seq_num[srcMacId]) {
+                seq_num[srcMacId] = event->macEvent.mpduDigest.mpducacheaddr;
+                received_count++;
+                
+                // 如果在时间窗口内，统计包数
+                if (time_window_started && !time_window_ended) {
+                    time_window_count++;
+                }
             }
             
-            if(received_count % 100 == 0) {
-                printf("disturb_rate=%d, disturb_power=%d, Received: %d\n", 
-                       disturb_rate, disturb_power, received_count);
+            if (received_count % 1000 == 0) {
+                printf("send_total_num: %d, 总接收: %d, 时间窗口内: %d\n", 
+                       send_total_num, received_count, time_window_count);
             }
         }
         
         free(event);
         
-        // 通过管道发送接收包数
-        if (write(pipefd[1], &received_count, sizeof(received_count)) != sizeof(received_count)) {
+        // 通过管道发送时间窗口内的包数（修复传参问题）
+        int write_result = write(pipefd[1], &time_window_count, sizeof(time_window_count));
+        if (write_result != sizeof(time_window_count)) {
             perror("pipe write failed");
+            printf("实际写入字节数: %d, 期望字节数: %zu\n", 
+                   write_result, sizeof(time_window_count));
+        } else {
+            printf("成功通过管道发送包数: %d\n", time_window_count);
         }
+        
         close(pipefd[1]);
         exit(0);
         
     } else if (pid > 0) {
-        // 父进程：发送数据
-        sleep(1); // 确保子进程已就绪
-        printf("发送进程启动, PID: %d, disturb_rate=%d, disturb_power=%d\n", 
-               getpid(), disturb_rate, disturb_power);
+        // 父进程：发送数据（修复版本）
+        close(pipefd[1]); // 关闭写端
         
-        for(int i = 0; i < SEND_NUM; i++) {
-            // 根据干扰率发送干扰包
-            if(i % 100 < disturb_rate) {
-                ssize_t written2 = write(h2c_fd, tx_buf2, buf_size);
-                if (written2 < 0) {
-                    perror("干扰包发送失败");
-                }
-            }
-
-            // 发送主数据包
-            uint8_t buffer1[BUFFER_SIZE] = {0};
-            bridge_data1.macEvent.mpduDigest.mpducacheaddr = i;
-            direct_reverse_mac_bridge_to_buffer(&bridge_data1, buffer1);
-            memcpy(tx_buf1, &buffer1, sizeof(buffer1));
+        // 设置非阻塞读取
+        int flags = fcntl(pipefd[0], F_GETFL, 0);
+        fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+        
+        // sleep(1); // 确保子进程已就绪
+        printf("发送进程启动, PID: %d, send_total_num=%d\n", 
+               getpid(), send_total_num);
+        struct timeval start_time, current_time;
+        gettimeofday(&start_time, NULL);
+        
+        // 发送进程持续运行，直到接收进程结束
+        for (int i = 0; i < SEND_NUM; i++){
+            // 检查接收进程是否结束
+            int status;
+            pid_t result = waitpid(pid, &status, WNOHANG);
             
-            ssize_t written = write(h2c_fd, tx_buf1, buf_size);
-            if (written < 0) {
-                perror("主数据包发送失败");
+            if (result == pid) {
+                // 接收进程已结束
+                printf("接收进程已结束，发送进程停止\n");
+                break;
+            } else if (result == -1) {
+                perror("waitpid failed");
                 break;
             }
             
+            // 发送数据包
+            for (int j = 1; j <= send_total_num; j++) {
+                uint8_t buffer1[BUFFER_SIZE] = {0};
+                bridge_data1.macEvent.mpduDigest.mpducacheaddr = i;
+                bridge_data1.macEvent.srcMacId = j;
+                direct_reverse_mac_bridge_to_buffer(&bridge_data1, buffer1);
+                memcpy(tx_buf1, buffer1, sizeof(buffer1));
+                
+                ssize_t written = write(h2c_fd, tx_buf1, buf_size);
+                if (written < 0) {
+                    perror("数据包发送失败");
+                }
+            }
             usleep(SEND_DELTA_TIME);
+            
+            // 定期检查管道是否有数据（每100个包检查一次）
+            if (i % 100 == 0) {
+                int received_total = 0;
+                ssize_t read_result = read(pipefd[0], &received_total, sizeof(received_total));
+                
+                if (read_result == sizeof(received_total)) {
+                    printf("从管道读取到包数: %d\n", received_total);
+                }
+            }
         }
         
-        printf("发送进程完成，等待接收进程结束...\n");
+        // 等待接收进程完全结束
         int status;
         wait(&status);
         
-        int received_total = 0;
+        int received_total = -1;
+        
+        // 最后尝试读取管道数据（修复传参问题）
         if (WIFEXITED(status)) {
-            // 从管道读取接收包数
-            if (read(pipefd[0], &received_total, sizeof(received_total)) == sizeof(received_total)) {
-                printf("测试完成: disturb_rate=%d, disturb_power=%d, 接收包数=%d/%d\n", 
-                       disturb_rate, disturb_power, received_total, SEND_NUM);
+            // 设置阻塞读取，确保读取到数据
+            fcntl(pipefd[0], F_SETFL, flags & ~O_NONBLOCK);
+            
+            ssize_t read_result = read(pipefd[0], &received_total, sizeof(received_total));
+            if (read_result == sizeof(received_total)) {
+                printf("测试完成: send_total_num=%d, 时间窗口内接收包数=%d\n", 
+                       send_total_num, received_total);
             } else {
                 perror("pipe read failed");
+                printf("实际读取字节数: %zd, 期望字节数: %zu\n", 
+                       read_result, sizeof(received_total));
                 received_total = -1;
             }
         }
@@ -463,7 +515,6 @@ int run_single_test(int disturb_rate, int disturb_power) {
         close(h2c_fd);
         close(c2h_fd);
         free(tx_buf1);
-        free(tx_buf2);
         free(rx_buf);
         
         return received_total;
@@ -471,6 +522,7 @@ int run_single_test(int disturb_rate, int disturb_power) {
     
     return -1;
 }
+
 
 /**
  * @brief 保存测试结果到CSV文件
@@ -480,19 +532,20 @@ int run_single_test(int disturb_rate, int disturb_power) {
  */
 void save_results_to_csv(TestResult* results, int num_results, const char* filename) {
     FILE* csv_file = fopen(filename, "w");
+    chmod(filename, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+    chown(filename, -1, getgrnam("gtx")->gr_gid);  // 将文件组改为gtx组
     if (!csv_file) {
         perror("无法打开CSV文件");
         return;
     }
     
     // 写入CSV标题
-    fprintf(csv_file, "DISTURB_RATE,DISTURB_POWER,RECEIVED_PACKETS\n");
+    fprintf(csv_file, "SEND_TOTAL_NUM,RECEIVED_PACKETS\n");
     
     // 写入数据
     for (int i = 0; i < num_results; i++) {
-        fprintf(csv_file, "%d,%d,%d\n", 
-                results[i].disturb_rate, 
-                results[i].disturb_power, 
+        fprintf(csv_file, "%d,%d\n", 
+                results[i].send_total_num, 
                 results[i].received_packets);
     }
     
@@ -504,17 +557,13 @@ void save_results_to_csv(TestResult* results, int num_results, const char* filen
 int main() {
     printf("=== 碰撞测试开始 ===\n");
     printf("测试参数范围:\n");
-    printf("DISTURB_RATE: %d-%d (步长%d)\n", 
-           DISTURB_RATE_MIN, DISTURB_RATE_MAX, DISTURB_RATE_STEP);
-    printf("DISTURB_POWER: %d-%d (步长%d)\n", 
-           DISTURB_POWER_MIN, DISTURB_POWER_MAX, DISTURB_POWER_STEP);
+    printf("SEND_TOTAL_NUM: %d-%d (步长%d)\n", 
+           SEND_TOTAL_NUM_MIN, SEND_TOTAL_NUM_MAX, SEND_TOTAL_NUM_STEP);
     printf("每个测试点发送包数: %d\n", SEND_NUM);
     printf("==================\n\n");
     
     // 计算测试点数量
-    int rate_steps = (DISTURB_RATE_MAX - DISTURB_RATE_MIN) / DISTURB_RATE_STEP + 1;
-    int power_steps = (DISTURB_POWER_MAX - DISTURB_POWER_MIN) / DISTURB_POWER_STEP + 1;
-    int total_tests = rate_steps * power_steps;
+    int total_tests = (SEND_TOTAL_NUM_MAX - SEND_TOTAL_NUM_MIN) / SEND_TOTAL_NUM_STEP + 1;
     
     printf("总共需要测试 %d 个点\n", total_tests);
     
@@ -527,41 +576,35 @@ int main() {
     
     int result_index = 0;
     
-    // 二重循环测试
-    for (int disturb_rate = DISTURB_RATE_MIN; disturb_rate <= DISTURB_RATE_MAX; disturb_rate += DISTURB_RATE_STEP) {
-        for (int disturb_power = DISTURB_POWER_MIN; disturb_power <= DISTURB_POWER_MAX; disturb_power += DISTURB_POWER_STEP) {
-            printf("\n=== 开始测试: DISTURB_RATE=%d, DISTURB_POWER=%d ===\n", 
-                   disturb_rate, disturb_power);
-            
-            int received_packets = run_single_test(disturb_rate, disturb_power);
-            
-            // 保存结果
-            results[result_index].disturb_rate = disturb_rate;
-            results[result_index].disturb_power = disturb_power;
-            results[result_index].received_packets = received_packets;
-            
-            printf("测试完成: DISTURB_RATE=%d, DISTURB_POWER=%d, 接收包数=%d/%d\n", 
-                   disturb_rate, disturb_power, received_packets, SEND_NUM);
-            
-            result_index++;
-        }
+    // 单重循环测试发送节点数
+    for (int send_total_num = SEND_TOTAL_NUM_MIN; send_total_num <= SEND_TOTAL_NUM_MAX; send_total_num += SEND_TOTAL_NUM_STEP) {
+        printf("\n=== 开始测试: SEND_TOTAL_NUM=%d ===\n", send_total_num);
+        
+        int received_packets = run_single_test(send_total_num);
+        
+        // 保存结果
+        results[result_index].send_total_num = send_total_num;
+        results[result_index].received_packets = received_packets;
+        
+        printf("测试完成: SEND_TOTAL_NUM=%d, 接收包数=%d/%d\n", 
+               send_total_num, received_packets, SEND_NUM);
+        
+        result_index++;
     }
     
     // 保存结果到CSV文件
-    save_results_to_csv(results, total_tests, "collision_test_results.csv");
+    save_results_to_csv(results, total_tests, "send_nodes_test_results.csv");
     
     // 打印汇总结果
     printf("\n=== 测试汇总 ===\n");
     for (int i = 0; i < total_tests; i++) {
-        printf("DISTURB_RATE=%3d, DISTURB_POWER=%3d, 接收包数=%4d/%d\n", 
-               results[i].disturb_rate, results[i].disturb_power, 
+        printf("SEND_TOTAL_NUM=%2d, 接收包数=%4d/%d\n", 
+               results[i].send_total_num, 
                results[i].received_packets, SEND_NUM);
     }
     
     free(results);
     printf("\n=== 碰撞测试完成 ===\n");
-    
-    return 0;
     
     return 0;
 }

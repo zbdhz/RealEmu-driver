@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/stat.h>  // 用于chmod函数和权限常量
+#include <grp.h>       // 用于getgrnam函数
 
 #define BUFFER_SIZE 64
 // 定义与Bluespec结构体对齐的数据结构
@@ -263,12 +265,27 @@ void print_current_time() {
 #define DEVICE_H2C "/dev/xdma0_h2c_0" // Host-to-Card 通道设备文件
 #define DEVICE_C2H "/dev/xdma0_c2h_0" // Card-to-Host 通道设备文件
 #define BURST_SIZE 1
-#define TEST_MCS 0              // MCS值 (0-7)
-#define TEST_POWER_START -32 + 64     // 起始功率值
+#define OUTPUT_CSV_FILE_PREFIX "sinr_success_rate_scaled_mcs"  // 输出CSV文件名前缀
+#define TEST_MCS 7              // MCS值 (0-7)
+#define TEST_POWER_START 32*19      // 起始功率值
 #define TEST_POWER_STEP 4         // 功率步进值
-#define TEST_POWER_STEPS 1       // 功率步进次数
+#define TEST_POWER_STEPS 32       // 功率步进次数
 #define PACKETS_PER_STEP 1000     // 每个功率点的测试包数
-#define SEND_DELTA_TIME 500 //us     
+#define SEND_DELTA_TIME 500 //us
+
+// 添加函数用于生成动态文件名
+char* generate_csv_filename(int mcs) {
+    // 分配足够的内存来存储文件名
+    char* filename = malloc(100 * sizeof(char));
+    if (!filename) {
+        return NULL;
+    }
+    
+    // 格式化文件名，包含MCS值
+    snprintf(filename, 100, "%s%d.csv", OUTPUT_CSV_FILE_PREFIX, mcs);
+    
+    return filename;
+}
 
 // 执行单个功率点的测试
 int run_single_test(int h2c_fd, int c2h_fd, uint8_t* tx_buf, uint8_t* rx_buf, size_t buf_size, int mcs, int power, int packet_count) {
@@ -343,6 +360,13 @@ int run_single_test(int h2c_fd, int c2h_fd, uint8_t* tx_buf, uint8_t* rx_buf, si
 
 
 int main() {
+        // 生成CSV文件名
+    char* csv_filename = generate_csv_filename(TEST_MCS);
+    if (!csv_filename) {
+        printf("内存分配失败\n");
+        return -1;
+    }
+
     // 打印测试配置 
     printf("=== 丢包测试配置 ===\n");
     printf("MCS值: %d\n", TEST_MCS);
@@ -350,13 +374,34 @@ int main() {
     printf("功率步进: %d\n", TEST_POWER_STEP);
     printf("功率步进次数: %d\n", TEST_POWER_STEPS);
     printf("每个功率点测试包数: %d\n", PACKETS_PER_STEP);
+    printf("输出CSV文件: %s\n", csv_filename);
     printf("===================\n\n");
+
+    // 打开CSV文件用于写入
+    FILE* csv_file = fopen(csv_filename, "w");
+
+    if (!csv_file) {
+        perror("无法打开输出CSV文件");
+        free(csv_filename);
+        return -1;
+    }
+    // 设置文件权限，允许所有用户读写
+    // chmod(csv_filename, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+
+    // 或者更精确地，允许文件所有者和gtx用户读写
+    chmod(csv_filename, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+    chown(csv_filename, -1, getgrnam("gtx")->gr_gid);  // 将文件组改为gtx组
+        // 写入CSV标题行
+    // fprintf(csv_file, "Power(dBm),Send,Recv,SuccessRate\n");
+
 
     int h2c_fd = open(DEVICE_H2C, O_RDWR); // 打开 H2C 设备
     int c2h_fd = open(DEVICE_C2H, O_RDWR); // 打开 C2H 设备
 
     if (h2c_fd < 0 || c2h_fd < 0) {
         perror("Failed to open XDMA device");
+        fclose(csv_file);
+        free(csv_filename);
         return -1;
     }
     printf("XDMA设备打开成功!\n");
@@ -370,6 +415,8 @@ int main() {
         perror("Memory allocation failed");
         close(h2c_fd);
         close(c2h_fd);
+        fclose(csv_file);
+        free(csv_filename);
         return -1;
     }
     memset(tx_buf, 0, buf_size);
@@ -383,7 +430,7 @@ int main() {
         .channelCfg = {
             .srcPhyId = 0,   // 源物理ID为0
             .dstPhyId = 1,   // 目标物理ID为1
-            .distance = 8    // 距离设为10
+            .distance = 8    // 距离设为8
         }
     };
 
@@ -407,6 +454,8 @@ int main() {
         close(c2h_fd);
         free(tx_buf);
         free(rx_buf);
+        fclose(csv_file);
+        free(csv_filename);
         return -1;
     }
 
@@ -456,13 +505,34 @@ int main() {
         printf("结果: MCS=%d, Power=%d, 接收=%d/%d, 丢包率=%.2f%%\n\n", 
                TEST_MCS, current_power-578, received_counts[step], 
                PACKETS_PER_STEP, loss_rate);
-    }
         
-    // 验证数据一致性
+        if(step == 0)
+        {
+            // 写入CSV标题行
+            fprintf(csv_file, "Power(dBm),Send,Recv,SuccessRate\n");
+        }
+        
+        // 将结果写入CSV文件
+        float success_rate = (float)received_counts[step] / PACKETS_PER_STEP;
+        fprintf(csv_file, "%.3f,%d,%d,%.2f\n", 
+                (float)(current_power-578)/32.0, PACKETS_PER_STEP, received_counts[step], success_rate);
+        
+        // 确保数据立即写入文件
+        fflush(csv_file);
+    }
+    // 关闭CSV文件
+    fclose(csv_file);
+    printf("测试结果已保存到CSV文件: %s\n", csv_filename);
+    
+    // 释放动态分配的内存
+    free(csv_filename);
+
+    //关闭打开的文件
     close(h2c_fd);
     close(c2h_fd);
     free(tx_buf);
     free(rx_buf);
+    free(received_counts);
     
     return 0;
 }
