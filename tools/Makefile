@@ -44,5 +44,5 @@ dma_from_device: dma_from_device.c dma_utils.c
 
 clean:
 	@echo "Cleaning tools..."
-	rm -f $(LIB_OBJS) $(LIB) $(PROGS)
+	rm -f $(OBJS) $(LIB_OBJS) $(LIB) $(PROGS)
 	@echo "Tools cleaned"
