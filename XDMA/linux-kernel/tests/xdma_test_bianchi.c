@@ -317,14 +317,14 @@ int run_single_test(int send_total_num) {
             .srcMacId = 1,
             .dstMacId = 0,
             .rfParam = {
-                .power = 5*32 + 578,
+                .power = 10*32 + 578,
                 .mcs = 0
             },
             .mpduDigest = {
                 .frametype = 2,
                 .framesubtype = 0,
-                .duration = 0,
-                .mpdulen = 256,
+                .duration = 2080,
+                .mpdulen = 1450,
                 .mpducacheaddr = 0
             },
             .status = 0,
