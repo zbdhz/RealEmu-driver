@@ -1,7 +1,7 @@
 # 顶层Makefile（类似wmediumd风格）
-SUBDIRS = core utils net
-BIN = core/myapp
-BINDIR = /usr/bin
+SUBDIRS = tools realemu-hw
+# BIN = core/myapp
+# BINDIR = /usr/bin
 
 all:
 	@for i in $(SUBDIRS); do \
@@ -13,5 +13,5 @@ clean:
 	echo "Clearing in $$i..."; \
 	(cd $$i; $(MAKE) clean); done
 
-install: all
-	install -m 0755 $(BIN) $(BINDIR)
+# install: all
+# 	install -m 0755 $(BIN) $(BINDIR)

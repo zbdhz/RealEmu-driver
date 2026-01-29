@@ -20,21 +20,78 @@
 
 #include <sys/types.h>
 #include <sys/mman.h>
+#include "reg_rw.h"
 
-/* ltoh: little endian to host */
-/* htol: host to little endian */
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-#define ltohl(x)       (x)
-#define ltohs(x)       (x)
-#define htoll(x)       (x)
-#define htols(x)       (x)
-#elif __BYTE_ORDER == __BIG_ENDIAN
-#define ltohl(x)     __bswap_32(x)
-#define ltohs(x)     __bswap_16(x)
-#define htoll(x)     __bswap_32(x)
-#define htols(x)     __bswap_16(x)
-#endif
+int reg_read(int fd, uint32_t address, uint32_t *value)
+{
+	off_t pgsz, target_aligned, offset;
+	void *map;
+	uint32_t read_result;
 
+	if (fd < 0) {
+		fprintf(stderr, "Device not initialized. Call reg_init() first.\n");
+		return -1;
+	}
+
+	if (value == NULL) {
+		fprintf(stderr, "Invalid parameter: value buffer is NULL\n");
+		return -1;
+	}
+
+	pgsz = sysconf(_SC_PAGESIZE);
+	offset = address & (pgsz - 1);
+	target_aligned = address & (~(pgsz - 1));
+
+	map = mmap(NULL, offset + 4, PROT_READ | PROT_WRITE, 
+		   MAP_SHARED, fd, target_aligned);
+	if (map == (void *)-1) {
+		fprintf(stderr, "Failed to map memory 0x%x: %s\n", 
+			address, strerror(errno));
+		return -1;
+	}
+
+	map = (char *)map + offset;
+	read_result = *((uint32_t *)map);
+	read_result = ltohl(read_result);
+	*value = read_result;
+
+	munmap((char *)map - offset, offset + 4);
+
+	return 0;
+}
+
+int reg_write(int fd, uint32_t address, uint32_t value)
+{
+	off_t pgsz, target_aligned, offset;
+	void *map;
+
+	if (fd < 0) {
+		fprintf(stderr, "Device not initialized. Call reg_init() first.\n");
+		return -1;
+	}
+
+	pgsz = sysconf(_SC_PAGESIZE);
+	offset = address & (pgsz - 1);
+	target_aligned = address & (~(pgsz - 1));
+
+	map = mmap(NULL, offset + 4, PROT_READ | PROT_WRITE, 
+		   MAP_SHARED, fd, target_aligned);
+	if (map == (void *)-1) {
+		fprintf(stderr, "Failed to map memory 0x%x: %s\n", 
+			address, strerror(errno));
+		return -1;
+	}
+
+	map = (char *)map + offset;
+	value = htoll(value);
+	*((uint32_t *)map) = value;
+
+	munmap((char *)map - offset, offset + 4);
+
+	return 0;
+}
+
+#ifndef BUILD_LIBRARY
 int main(int argc, char **argv)
 {
 	int fd;
@@ -177,3 +234,4 @@ close:
 
 	return err;
 }
+#endif

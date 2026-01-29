@@ -15,7 +15,7 @@
 #include <sys/wait.h>
 
 // 定义与Bluespec结构体对齐的数据结构
-#pragma pack(push, 1) // 禁用内存对齐，确保与FPGA侧严格匹配
+// #pragma pack(push, 1) // 禁用内存对齐，确保与FPGA侧严格匹配
 
 // BridgeTag 结构体
 typedef struct {
@@ -60,7 +60,7 @@ typedef struct {
     BridgeTag bridgeTag;   // BridgeTag 结构体
 } CfgBridge_TOP;
 
-#pragma pack(pop) // 恢复默认对齐
+// #pragma pack(pop) // 恢复默认对齐
 
 
 #define BUFFER_SIZE 64

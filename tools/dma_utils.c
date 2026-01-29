@@ -14,6 +14,7 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/types.h>
+#include "dma_utils.h"
 
 /*
  * man 2 write:
@@ -22,8 +23,6 @@
  *	actually transferred.  (This is true on both 32-bit and 64-bit
  *	systems.)
  */
-
-#define RW_MAX_SIZE	0x7ffff000
 
 int verbose = 0;
 
@@ -40,6 +39,11 @@ uint64_t getopt_integer(char *optarg)
 	return value;
 }
 
+//从文件/设备中读取数据到缓存区
+//fname 待写入的文件名
+//fd 文件打开的句柄
+//buffer 源数据的缓存指针
+//size 读取的总字节数
 ssize_t read_to_buffer(char *fname, int fd, char *buffer, uint64_t size,
 			uint64_t base)
 {
@@ -75,7 +79,7 @@ ssize_t read_to_buffer(char *fname, int fd, char *buffer, uint64_t size,
 		}
 
 		count += rc;
-		if (rc != bytes) {
+		if ((uint64_t)rc != bytes) {
 			fprintf(stderr, "%s, read underflow 0x%lx/0x%lx @ 0x%lx.\n",
 				fname, rc, bytes, offset);
 			break;
@@ -92,11 +96,16 @@ ssize_t read_to_buffer(char *fname, int fd, char *buffer, uint64_t size,
 	return count;
 }
 
+//从缓存器中读取数据并且写入到文件/设备中
+//fname 待写入的文件名
+//fd 文件打开的句柄
+//buffer 源数据的缓存指针
+//size 写入的总字节数
 ssize_t write_from_buffer(char *fname, int fd, char *buffer, uint64_t size,
 			uint64_t base)
 {
 	ssize_t rc;
-	uint64_t count = 0;
+	uint64_t count = 0;//已经写入的字节数
 	char *buf = buffer;
 	off_t offset = base;
 	int loop = 0;
@@ -127,7 +136,7 @@ ssize_t write_from_buffer(char *fname, int fd, char *buffer, uint64_t size,
 		}
 
 		count += rc;
-		if (rc != bytes) {
+		if ((uint64_t)rc != bytes) {
 			fprintf(stderr, "%s, write underflow 0x%lx/0x%lx @ 0x%lx.\n",
 				fname, rc, bytes, offset);
 			break;

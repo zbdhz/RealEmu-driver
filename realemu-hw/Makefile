@@ -1,7 +1,7 @@
-# tools Makefile
-# 与xdma驱动抽象出来的文件相交互
-# 实现上层数据和fpga数据的交换
-# 主要包含xdma转换后的axi-stream的上下行接口操作和axi-lite的寄存器接口操作
+# realemu-hw Makefile
+# RealEmu硬件接口程序
+# 实现与FPGA硬件的交互功能
+
 VERSION_STR="\"1.0\""
 
 # CC = gcc
@@ -54,29 +54,38 @@ CFLAGS += $(shell $(PKG_CONFIG) --cflags $(NLLIBNAME))
 CFLAGS += -DVERSION_STR=$(VERSION_STR)
 LDFLAGS += -lconfig -lpthread
 
-# 需要生成可执行文件的程序
-EXECUTABLES = 
+# 添加头文件搜索路径
+CFLAGS += -I../include
+CFLAGS += -I../tools
 
-# 只需要生成 .o 文件的源文件（不生成可执行文件）
-LIB_OBJS = reg_rw.o dma_with_device.o dma_utils.o
+# 目标可执行文件
+TARGET = realemu_hw
+
+# 主程序源文件
+MAIN_SRC = realemu_hw.c
+
+# 主程序目标文件
+MAIN_OBJ = $(MAIN_SRC:.c=.o)
+
+# 依赖的 tools 目录中的目标文件
+TOOLS_OBJS = ../tools/reg_rw.o ../tools/dma_with_device.o ../tools/dma_utils.o
 
 # 所有目标文件
-OBJECTS = $(EXECUTABLES:=.o) $(LIB_OBJS:.c=.o)
+OBJECTS = $(MAIN_OBJ)
 
-all: $(EXECUTABLES) $(LIB_OBJS:.c=.o)
+all: $(TARGET)
 
-# 为可执行文件创建链接规则
-$(EXECUTABLES): %: %.o
-	@echo "Building $@..."
-	$(CC) -o $@ $< $(LDFLAGS)
-	@echo "$@ built successfully"
+$(TARGET): $(MAIN_OBJ) $(TOOLS_OBJS)
+	@echo "Building $(TARGET)..."
+	$(CC) -o $@ $(MAIN_OBJ) $(TOOLS_OBJS) $(LDFLAGS)
+	@echo "$(TARGET) built successfully"
 
-# 为库文件创建编译规则
-$(LIB_OBJS): %.o: %.c
+# 编译主程序
+$(MAIN_OBJ): $(MAIN_SRC)
 	@echo "Compiling $<..."
-	$(CC) $(CFLAGS) -DBUILD_LIBRARY -c -o $@ $<
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	@echo "Cleaning $(OBJECTS) $(EXECUTABLES)..."
-	rm -f $(OBJECTS) $(EXECUTABLES)
+	@echo "Cleaning $(MAIN_OBJ) $(TARGET)..."
+	rm -f $(MAIN_OBJ) $(TARGET)
 	@echo "Clean completed"

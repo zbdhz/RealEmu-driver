@@ -265,7 +265,7 @@ void print_current_time() {
 
 #define DEVICE_H2C "/dev/xdma0_h2c_0" // Host-to-Card 通道设备文件
 #define DEVICE_C2H "/dev/xdma0_c2h_0" // Card-to-Host 通道设备文件
-#define BURST_SIZE 1
+// #define BURST_SIZE 1
 
 
 int main() {

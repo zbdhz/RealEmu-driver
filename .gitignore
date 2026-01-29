@@ -49,39 +49,15 @@ dma_from_device
 # ============================================
 
 # 测试数据文件
-test_data.bin
-*.dat
 
 # ============================================
 # IDE和编辑器文件
 # ============================================
 
-# VSCode
-.vscode/
-*.code-workspace
-
-# Vim
-.netrwr
-*.tags
-
-# Emacs
-*~
-\#*\#
-.\#*
 
 # ============================================
 # 操作系统文件
 # ============================================
-
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-
-# Windows
-Thumbs.db
-ehthumbs.db
-Desktop.ini
 
 # Linux
 *~
@@ -111,4 +87,4 @@ realwmediumd/realwmediumd
 
 # test目录
 test/*.o
-test/test_*
+# test/test_*
