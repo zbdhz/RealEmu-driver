@@ -1,6 +1,8 @@
 #include <fcntl.h>
 #include <stdint.h>
-
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
 
 #include "realemu_hw.h"
 #include "../tools/reg_rw.h"
@@ -159,7 +161,290 @@ void buffer_to_mac_bridge(const uint8_t* buffer, MacBridge_TOP* data) {
     bit_pos += 10;
 }
 
+static int realemu_init_tx_queue(struct realemu_device *realemu_device, u16 qid) {
+    if (realemu_device == NULL || qid >= REALEMU_MAX_TX_QUEUES) {
+        return -1;
+    }
 
+    RealEmu_Tx_Queue *tx_queue = (RealEmu_Tx_Queue *)malloc(sizeof(RealEmu_Tx_Queue));
+    if (tx_queue == NULL) {
+        return -1;
+    }
+
+    memset(tx_queue, 0, sizeof(RealEmu_Tx_Queue));
+
+    for (int i = 0; i < REALEMU_QUEUE_DEPTH; i++) {
+        tx_queue->data[i] = (RealEmu_Queue_Data *)malloc(sizeof(RealEmu_Queue_Data));
+        if (tx_queue->data[i] == NULL) {
+            for (int j = 0; j < i; j++) {
+                free(tx_queue->data[j]);
+            }
+            free(tx_queue);
+            return -1;
+        }
+        memset(tx_queue->data[i], 0, sizeof(RealEmu_Queue_Data));
+    }
+
+    tx_queue->qid = qid;
+    tx_queue->head = 0;
+    tx_queue->tail = 0;
+    tx_queue->count = 0;
+    tx_queue->state = 0;
+
+    if (pthread_mutex_init(&tx_queue->lock, NULL) != 0) {
+        for (int i = 0; i < REALEMU_QUEUE_DEPTH; i++) {
+            free(tx_queue->data[i]);
+        }
+        free(tx_queue);
+        return -1;
+    }
+
+    realemu_device->tx_queue[qid] = tx_queue;
+    return 0;
+}
+
+static int realemu_init_rx_queue(struct realemu_device *realemu_device, u16 qid) {
+    if (realemu_device == NULL || qid >= REALEMU_MAX_RX_QUEUES) {
+        return -1;
+    }
+
+    RealEmu_Rx_Queue *rx_queue = (RealEmu_Rx_Queue *)malloc(sizeof(RealEmu_Rx_Queue));
+    if (rx_queue == NULL) {
+        return -1;
+    }
+
+    memset(rx_queue, 0, sizeof(RealEmu_Rx_Queue));
+
+    for (int i = 0; i < REALEMU_QUEUE_DEPTH; i++) {
+        rx_queue->data[i] = (RealEmu_Queue_Data *)malloc(sizeof(RealEmu_Queue_Data));
+        if (rx_queue->data[i] == NULL) {
+            for (int j = 0; j < i; j++) {
+                free(rx_queue->data[j]);
+            }
+            free(rx_queue);
+            return -1;
+        }
+        memset(rx_queue->data[i], 0, sizeof(RealEmu_Queue_Data));
+    }
+
+    rx_queue->qid = qid;
+    rx_queue->head = 0;
+    rx_queue->tail = 0;
+    rx_queue->count = 0;
+    rx_queue->state = 0;
+
+    if (pthread_mutex_init(&rx_queue->lock, NULL) != 0) {
+        for (int i = 0; i < REALEMU_QUEUE_DEPTH; i++) {
+            free(rx_queue->data[i]);
+        }
+        free(rx_queue);
+        return -1;
+    }
+
+    realemu_device->rx_queue[qid] = rx_queue;
+    return 0;
+}
+
+static void realemu_tx_queue_clean(RealEmu_Tx_Queue *q) {
+    if (q == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&q->lock);
+
+    for (int i = 0; i < REALEMU_QUEUE_DEPTH; i++) {
+        if (q->data[i] != NULL) {
+            free(q->data[i]);
+            q->data[i] = NULL;
+        }
+    }
+
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    q->state = 0;
+
+    pthread_mutex_unlock(&q->lock);
+    pthread_mutex_destroy(&q->lock);
+}
+
+static void realemu_rx_queue_clean(RealEmu_Rx_Queue *q) {
+    if (q == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&q->lock);
+
+    for (int i = 0; i < REALEMU_QUEUE_DEPTH; i++) {
+        if (q->data[i] != NULL) {
+            free(q->data[i]);
+            q->data[i] = NULL;
+        }
+    }
+
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    q->state = 0;
+
+    pthread_mutex_unlock(&q->lock);
+    pthread_mutex_destroy(&q->lock);
+}
+
+static uint32_t realemu_get_node_base_addr(uint32_t node_id) {
+    if (node_id >= REALEMU_NODE_COUNT) {
+        return 0xFFFFFFFF;
+    }
+    return REALEMU_NODE_BASE_ADDR + (node_id * REALEMU_NODE_SIZE);
+}
+
+static uint32_t realemu_get_mac_reg_addr(uint32_t node_id, uint32_t reg_offset) {
+    uint32_t node_base = realemu_get_node_base_addr(node_id);
+    if (node_base == 0xFFFFFFFF) {
+        return 0xFFFFFFFF;
+    }
+    return node_base + REALEMU_MAC_OFFSET + reg_offset;
+}
+
+static uint32_t realemu_get_phy_reg_addr(uint32_t node_id, uint32_t reg_offset) {
+    uint32_t node_base = realemu_get_node_base_addr(node_id);
+    if (node_base == 0xFFFFFFFF) {
+        return 0xFFFFFFFF;
+    }
+    return node_base + REALEMU_PHY_OFFSET + reg_offset;
+}
+
+static const RegisterInfo* realemu_find_mac_reg_by_name(const char *name) {
+    if (name == NULL) {
+        return NULL;
+    }
+    
+    for (size_t i = 0; i < sizeof(mac_reg_table) / sizeof(RegisterInfo); i++) {
+        if (strcmp(mac_reg_table[i].name, name) == 0) {
+            return &mac_reg_table[i];
+        }
+    }
+    return NULL;
+}
+
+static const RegisterInfo* realemu_find_phy_reg_by_name(const char *name) {
+    if (name == NULL) {
+        return NULL;
+    }
+    
+    for (size_t i = 0; i < sizeof(phy_reg_table) / sizeof(RegisterInfo); i++) {
+        if (strcmp(phy_reg_table[i].name, name) == 0) {
+            return &phy_reg_table[i];
+        }
+    }
+    return NULL;
+}
+
+int realemu_write_reg(RealEmu_Device* realemu_device, uint32_t node_id, const char *reg_name, uint32_t value) {
+    if (realemu_device == NULL || reg_name == NULL) {
+        fprintf(stderr, "Error: Invalid parameters\n");
+        return -1;
+    }
+    
+    if (realemu_device->user_reg_fd < 0) {
+        fprintf(stderr, "Error: Invalid file descriptor\n");
+        return -1;
+    }
+    
+    if (node_id >= REALEMU_NODE_COUNT) {
+        fprintf(stderr, "Error: Invalid node_id %u (max: %u)\n", node_id, REALEMU_NODE_COUNT - 1);
+        return -1;
+    }
+    
+    const RegisterInfo *mac_reg = realemu_find_mac_reg_by_name(reg_name);
+    const RegisterInfo *phy_reg = realemu_find_phy_reg_by_name(reg_name);
+    
+    uint32_t addr;
+    const RegisterInfo *reg_info = NULL;
+    
+    if (mac_reg != NULL) {
+        if ((mac_reg->access & REG_ACCESS_WO) == 0) {
+            fprintf(stderr, "Warning: MAC register '%s' is not writable\n", reg_name);
+        }
+        addr = realemu_get_mac_reg_addr(node_id, mac_reg->offset);
+        reg_info = mac_reg;
+    } else if (phy_reg != NULL) {
+        if ((phy_reg->access & REG_ACCESS_WO) == 0) {
+            fprintf(stderr, "Warning: PHY register '%s' is not writable\n", reg_name);
+        }
+        addr = realemu_get_phy_reg_addr(node_id, phy_reg->offset);
+        reg_info = phy_reg;
+    } else {
+        fprintf(stderr, "Error: Register '%s' not found\n", reg_name);
+        return -1;
+    }
+    
+    if (addr == 0xFFFFFFFF) {
+        fprintf(stderr, "Error: Failed to calculate register address\n");
+        return -1;
+    }
+    
+    if (reg_write(realemu_device->user_reg_fd, addr, value) != 0) {
+        fprintf(stderr, "Error: Failed to write register '%s' at node %u (addr: 0x%08X)\n", 
+                reg_name, node_id, addr);
+        return -1;
+    }
+    
+    return 0;
+}
+
+int realemu_read_reg(RealEmu_Device* realemu_device, uint32_t node_id, const char *reg_name, uint32_t *value) {
+    if (realemu_device == NULL || reg_name == NULL || value == NULL) {
+        fprintf(stderr, "Error: Invalid parameters\n");
+        return -1;
+    }
+    
+    if (realemu_device->user_reg_fd < 0) {
+        fprintf(stderr, "Error: Invalid file descriptor\n");
+        return -1;
+    }
+    
+    if (node_id >= REALEMU_NODE_COUNT) {
+        fprintf(stderr, "Error: Invalid node_id %u (max: %u)\n", node_id, REALEMU_NODE_COUNT - 1);
+        return -1;
+    }
+    
+    const RegisterInfo *mac_reg = realemu_find_mac_reg_by_name(reg_name);
+    const RegisterInfo *phy_reg = realemu_find_phy_reg_by_name(reg_name);
+    
+    uint32_t addr;
+    const RegisterInfo *reg_info = NULL;
+    
+    if (mac_reg != NULL) {
+        if ((mac_reg->access & REG_ACCESS_RO) == 0) {
+            fprintf(stderr, "Warning: MAC register '%s' is not readable\n", reg_name);
+        }
+        addr = realemu_get_mac_reg_addr(node_id, mac_reg->offset);
+        reg_info = mac_reg;
+    } else if (phy_reg != NULL) {
+        if ((phy_reg->access & REG_ACCESS_RO) == 0) {
+            fprintf(stderr, "Warning: PHY register '%s' is not readable\n", reg_name);
+        }
+        addr = realemu_get_phy_reg_addr(node_id, phy_reg->offset);
+        reg_info = phy_reg;
+    } else {
+        fprintf(stderr, "Error: Register '%s' not found\n", reg_name);
+        return -1;
+    }
+    
+    if (addr == 0xFFFFFFFF) {
+        fprintf(stderr, "Error: Failed to calculate register address\n");
+        return -1;
+    }
+    
+    if (reg_read(realemu_device->user_reg_fd, addr, value) != 0) {
+        fprintf(stderr, "Error: Failed to read register '%s' at node %u (addr: 0x%08X)\n", 
+                reg_name, node_id, addr);
+        return -1;
+    }
+    
+    return 0;
+}
 
 int main(){
     int fd = -1;

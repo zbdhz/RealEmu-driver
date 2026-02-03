@@ -3,10 +3,86 @@
 
 #include "realemu_top.h"
 
-#define REALEMU_MAX_QUEUE_DEPTH 128
+
+#define REALEMU_QUEUE_DEPTH 1024
 #define REALEMU_MAX_TX_QUEUES 3
 #define REALEMU_MAX_RX_QUEUES 1
 
+//寄存器相关配置
+
+#define REALEMU_TOTAL_ADDR_MIN    0x00000000
+#define REALEMU_TOTAL_ADDR_MAX    0x001FFFFF
+#define REALEMU_ADAPTER_ADDR_MIN  0x00000000
+#define REALEMU_ADAPTER_ADDR_MAX  0x000FFFFF
+#define REALEMU_NODE_ADDR_MIN     0x00100000
+#define REALEMU_NODE_ADDR_MAX     0x001FFFFF
+
+#define REALEMU_NODE_BASE_ADDR    0x00100000
+#define REALEMU_NODE_SIZE        0x00000400
+#define REALEMU_NODE_COUNT       1024
+
+#define REALEMU_MAC_OFFSET       0x00000000
+#define REALEMU_PHY_OFFSET       0x00000200
+#define REALEMU_MAC_SIZE        0x00000200
+#define REALEMU_PHY_SIZE        0x00000200
+
+typedef enum {
+    REG_ACCESS_RO = 0x01,
+    REG_ACCESS_WO = 0x02,
+    REG_ACCESS_RW = 0x03
+} RegAccessType;
+
+typedef enum {
+    REG_TYPE_MAC_CONFIG,
+    REG_TYPE_MAC_STATUS,
+    REG_TYPE_PHY_STATUS
+} RegType;
+
+typedef struct {
+    const char *name;
+    uint32_t offset;
+    uint8_t access;
+    RegType type;
+    const char *description;
+} RegisterInfo;
+
+static const RegisterInfo mac_reg_table[] = {
+    {"SLOT_TIME",       0x000, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "Slot time"},
+    {"SIFS",            0x004, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "SIFS"},
+    {"DIFS",            0x008, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "DIFS"},
+    {"EIFS",            0x00C, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "EIFS"},
+    {"SIG_TIME",        0x010, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "Signal time"},
+    {"OFDM_SYMBOL",     0x014, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "OFDM symbol time"},
+    {"MAX_NUM",         0x018, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "Max num"},
+    {"PHY_DELAY",       0x01C, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "PHY delay"},
+    {"TIMEOUT",         0x020, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "Timeout"},
+    {"CW_MIN",          0x024, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "CW min"},
+    {"CW_MAX",          0x028, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "CW max"},
+    {"RTS_THRESH",      0x02C, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "RTS threshold"},
+    {"RETRY_LIMIT",     0x030, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "Retry limit"},
+    {"NAV_EN",          0x034, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "NAV enable"},
+    {"TXOP_EN",         0x038, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "TXOP enable"},
+    {"FILTER_EN",       0x03C, REG_ACCESS_RW, REG_TYPE_MAC_CONFIG, "Filter enable"},
+    {"BACKOFF_STATE",   0x040, REG_ACCESS_RO, REG_TYPE_MAC_STATUS,  "Backoff state"},
+    {"DCF_STATE",       0x044, REG_ACCESS_RO, REG_TYPE_MAC_STATUS,  "DCF state"},
+    {"FIFOIN_DEPTH",    0x048, REG_ACCESS_RO, REG_TYPE_MAC_STATUS,  "FIFO in depth"},
+    {"FIFOIN_COUNT",    0x04C, REG_ACCESS_RO, REG_TYPE_MAC_STATUS,  "FIFO in count"},
+};
+
+static const RegisterInfo phy_reg_table[] = {
+    {"FSM_STATE",       0x200, REG_ACCESS_RO, REG_TYPE_PHY_STATUS, "FSM state"},
+    {"CCA_BUSY",        0x204, REG_ACCESS_RO, REG_TYPE_PHY_STATUS, "CCA busy"},
+    {"RX_POWER_DBM",    0x208, REG_ACCESS_RO, REG_TYPE_PHY_STATUS, "RX power (dBm)"},
+    {"FCS_EN",          0x20C, REG_ACCESS_RW, REG_TYPE_PHY_STATUS, "FCS enable"},
+    {"FCS_CORRECT",     0x210, REG_ACCESS_RO, REG_TYPE_PHY_STATUS, "FCS correct"},
+};
+
+typedef struct {
+    uint32_t node_id;
+    const char *node_name;
+} NodeInfo;
+
+//寄存器相关配置
 
 
 // BridgeTag 结构体
@@ -144,3 +220,5 @@ int realemu_device_update_tx_queue(RealEmu_Device* realemu_device);
 int realemu_device_update_rx_queue(RealEmu_Device* realemu_device);
 int handle_recv_pkt_data(RealEmu_Device* realemu_device, MacEvent* macevent);
 int handle_regacces_request(RealEmu_Device* realemu_device, uint32_t reg_addr, uint32_t* reg_val);
+int realemu_write_reg(RealEmu_Device* realemu_device, uint32_t node_id, const char *reg_name, uint32_t value);
+int realemu_read_reg(RealEmu_Device* realemu_device, uint32_t node_id, const char *reg_name, uint32_t *value);
