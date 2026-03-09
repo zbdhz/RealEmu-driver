@@ -1,8 +1,11 @@
+#include <stdio.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <errno.h>
+#include <unistd.h>
 
 #include "realemu_hw.h"
 #include "../tools/reg_rw.h"
@@ -58,10 +61,10 @@ void direct_reverse_mac_bridge_to_buffer(const MacBridge_TOP* data, uint8_t* buf
 }
 
 //将CfgBridge_TOP结构体数据转化为二进制缓冲区
-void direct_reverse_cfg_bridge_to_buffer(const CfgBridge_TOP* data, uint8_t* buffer) {
+void direct_reverse_cfg_bridge_topo_to_buffer(const CfgBridge_Topo* data, uint8_t* buffer) {
     size_t bit_pos = 0;
     // 从最低位开始反向设置
-    set_bits(buffer, bit_pos, 1, data->bridgeTag.notUsed);
+    set_bits(buffer, bit_pos, 7, data->bridgeTag.notUsed);
     bit_pos += 7;
     set_bit(buffer, bit_pos++, data->bridgeTag.control);
     set_bits(buffer, bit_pos, 10, data->channelCfg.distance);
@@ -70,6 +73,17 @@ void direct_reverse_cfg_bridge_to_buffer(const CfgBridge_TOP* data, uint8_t* buf
     bit_pos += 10;
     set_bits(buffer, bit_pos, 10, data->channelCfg.srcPhyId);
     bit_pos += 10;
+}
+
+void direct_reverse_cfg_bridge_per_to_buffer(const CfgBridge_Per* data, uint8_t* buffer){
+    size_t bit_pos = 0;
+    // 从最低位开始反向设置
+    set_bits(buffer, bit_pos, 7, data->bridgeTag.notUsed);
+    bit_pos += 7;
+    set_bit(buffer, bit_pos++, data->bridgeTag.control);
+    set_bits(buffer, bit_pos, 16, data->perCfg.perOut);
+    bit_pos += 16;
+    set_bits(buffer, bit_pos, 14, data->perCfg.perIn);
 }
 
 void buffer_to_mac_bridge(const uint8_t* buffer, MacBridge_TOP* data) {
@@ -161,8 +175,8 @@ void buffer_to_mac_bridge(const uint8_t* buffer, MacBridge_TOP* data) {
     bit_pos += 10;
 }
 
-static int realemu_init_tx_queue(struct realemu_device *realemu_device, u16 qid) {
-    if (realemu_device == NULL || qid >= REALEMU_MAX_TX_QUEUES) {
+static int realemu_init_tx_queue(struct realemu_device *realemu_device, uint16_t qid) {
+    if (realemu_device == NULL || qid >= REALEMU_TX_QUEUES) {
         return -1;
     }
 
@@ -203,8 +217,8 @@ static int realemu_init_tx_queue(struct realemu_device *realemu_device, u16 qid)
     return 0;
 }
 
-static int realemu_init_rx_queue(struct realemu_device *realemu_device, u16 qid) {
-    if (realemu_device == NULL || qid >= REALEMU_MAX_RX_QUEUES) {
+static int realemu_init_rx_queue(struct realemu_device *realemu_device, uint16_t qid) {
+    if (realemu_device == NULL || qid >= REALEMU_RX_QUEUES) {
         return -1;
     }
 
@@ -360,20 +374,17 @@ int realemu_write_reg(RealEmu_Device* realemu_device, uint32_t node_id, const ch
     const RegisterInfo *phy_reg = realemu_find_phy_reg_by_name(reg_name);
     
     uint32_t addr;
-    const RegisterInfo *reg_info = NULL;
     
     if (mac_reg != NULL) {
         if ((mac_reg->access & REG_ACCESS_WO) == 0) {
             fprintf(stderr, "Warning: MAC register '%s' is not writable\n", reg_name);
         }
         addr = realemu_get_mac_reg_addr(node_id, mac_reg->offset);
-        reg_info = mac_reg;
     } else if (phy_reg != NULL) {
         if ((phy_reg->access & REG_ACCESS_WO) == 0) {
             fprintf(stderr, "Warning: PHY register '%s' is not writable\n", reg_name);
         }
         addr = realemu_get_phy_reg_addr(node_id, phy_reg->offset);
-        reg_info = phy_reg;
     } else {
         fprintf(stderr, "Error: Register '%s' not found\n", reg_name);
         return -1;
@@ -413,20 +424,17 @@ int realemu_read_reg(RealEmu_Device* realemu_device, uint32_t node_id, const cha
     const RegisterInfo *phy_reg = realemu_find_phy_reg_by_name(reg_name);
     
     uint32_t addr;
-    const RegisterInfo *reg_info = NULL;
     
     if (mac_reg != NULL) {
         if ((mac_reg->access & REG_ACCESS_RO) == 0) {
             fprintf(stderr, "Warning: MAC register '%s' is not readable\n", reg_name);
         }
         addr = realemu_get_mac_reg_addr(node_id, mac_reg->offset);
-        reg_info = mac_reg;
     } else if (phy_reg != NULL) {
         if ((phy_reg->access & REG_ACCESS_RO) == 0) {
             fprintf(stderr, "Warning: PHY register '%s' is not readable\n", reg_name);
         }
         addr = realemu_get_phy_reg_addr(node_id, phy_reg->offset);
-        reg_info = phy_reg;
     } else {
         fprintf(stderr, "Error: Register '%s' not found\n", reg_name);
         return -1;
@@ -446,12 +454,590 @@ int realemu_read_reg(RealEmu_Device* realemu_device, uint32_t node_id, const cha
     return 0;
 }
 
-int main(){
-    int fd = -1;
-    if (fd < 0) {
+RealEmu_Device* realemu_device_init(char *h2c_dev, char *c2h_dev, char *user_dev){
+    if (h2c_dev == NULL || c2h_dev == NULL || user_dev == NULL) {
+        fprintf(stderr, "Error: Invalid parameters\n");
+        return NULL;
+    }
+
+    RealEmu_Device* realemu_device = (RealEmu_Device *)malloc(sizeof(RealEmu_Device));
+    if (realemu_device == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory for RealEmu_Device\n");
+        return NULL;
+    }
+
+    realemu_device->xdma_h2c_fd = open(h2c_dev, O_RDWR);
+    if (realemu_device->xdma_h2c_fd < 0) {
+        fprintf(stderr, "Error: Failed to open H2C device %s: %s\n", h2c_dev, strerror(errno));
+        free(realemu_device);
+        return NULL;
+    }
+
+    realemu_device->xdma_c2h_fd = open(c2h_dev, O_RDWR);
+    if (realemu_device->xdma_c2h_fd < 0) {
+        fprintf(stderr, "Error: Failed to open C2H device %s: %s\n", c2h_dev, strerror(errno));
+        close(realemu_device->xdma_h2c_fd);
+        free(realemu_device);
+        return NULL;
+    }
+
+    realemu_device->user_reg_fd = open(user_dev, O_RDWR);
+    if (realemu_device->user_reg_fd < 0) {
+        fprintf(stderr, "Error: Failed to open user register device %s: %s\n", user_dev, strerror(errno));
+        close(realemu_device->xdma_h2c_fd);
+        close(realemu_device->xdma_c2h_fd);
+        free(realemu_device);
+        return NULL;
+    }
+
+    realemu_device->node_num = NODE_NUM;
+
+    for (int i = 0; i < REALEMU_TX_QUEUES; i++) {
+        realemu_device->tx_queue[i] = NULL;
+    }
+
+    for (int i = 0; i < REALEMU_RX_QUEUES; i++) {
+        realemu_device->rx_queue[i] = NULL;
+    }
+
+    for (int i = 0; i < REALEMU_TX_QUEUES; i++) {
+        if (realemu_init_tx_queue(realemu_device, i) != 0) {
+            fprintf(stderr, "Error: Failed to initialize TX queue %d\n", i);
+            for (int j = 0; j < i; j++) {
+                if (realemu_device->tx_queue[j] != NULL) {
+                    realemu_tx_queue_clean(realemu_device->tx_queue[j]);
+                    free(realemu_device->tx_queue[j]);
+                }
+            }
+            close(realemu_device->xdma_h2c_fd);
+            close(realemu_device->xdma_c2h_fd);
+            close(realemu_device->user_reg_fd);
+            free(realemu_device);
+            return NULL;
+        }
+    }
+
+    for (int i = 0; i < REALEMU_RX_QUEUES; i++) {
+        if (realemu_init_rx_queue(realemu_device, i) != 0) {
+            fprintf(stderr, "Error: Failed to initialize RX queue %d\n", i);
+            for (int j = 0; j < REALEMU_TX_QUEUES; j++) {
+                if (realemu_device->tx_queue[j] != NULL) {
+                    realemu_tx_queue_clean(realemu_device->tx_queue[j]);
+                    free(realemu_device->tx_queue[j]);
+                }
+            }
+            for (int j = 0; j < i; j++) {
+                if (realemu_device->rx_queue[j] != NULL) {
+                    realemu_rx_queue_clean(realemu_device->rx_queue[j]);
+                    free(realemu_device->rx_queue[j]);
+                }
+            }
+            close(realemu_device->xdma_h2c_fd);
+            close(realemu_device->xdma_c2h_fd);
+            close(realemu_device->user_reg_fd);
+            free(realemu_device);
+            return NULL;
+        }
+    }
+
+    return realemu_device;
+}
+
+
+int send_pkt_data(RealEmu_Device* realemu_device, MacEvent macevent){
+    if (realemu_device == NULL) {
+        fprintf(stderr, "Error: Invalid device pointer\n");
         return -1;
     }
-    char rx_buffer[512];
-    read_bits_from_device_to_host(fd, rx_buffer, 512);
+
+    int queue_id = 0; // 数据包使用TX队列0
+    RealEmu_Tx_Queue *tx_queue = realemu_device->tx_queue[queue_id];
+    if (tx_queue == NULL) {
+        fprintf(stderr, "Error: TX queue %d not initialized\n", queue_id);
+        return -1;
+    }
+
+    if (tx_queue->count >= REALEMU_QUEUE_DEPTH) {
+        fprintf(stderr, "Error: TX queue %d is full\n", queue_id);
+        return -1;
+    }
+
+    if (pthread_mutex_lock(&tx_queue->lock) != 0) {
+        fprintf(stderr, "Error: Failed to lock TX queue\n");
+        return -1;
+    }
+
+    MacBridge_TOP mac_bridge;
+    mac_bridge.macEvent = macevent;
+    mac_bridge.bridgeTag.notUsed = 0;
+    mac_bridge.bridgeTag.control = 0;
+
+    RealEmu_Queue_Data *queue_data = tx_queue->data[tx_queue->head];
+    if (queue_data == NULL) {
+        fprintf(stderr, "Error: Queue data buffer not allocated\n");
+        pthread_mutex_unlock(&tx_queue->lock);
+        return -1;
+    }
+
+    direct_reverse_mac_bridge_to_buffer(&mac_bridge, queue_data->buffer);
+
+    tx_queue->head = (tx_queue->head + 1) % REALEMU_QUEUE_DEPTH;
+    tx_queue->count++;
+
+    pthread_mutex_unlock(&tx_queue->lock);
+    return 0;
+}
+
+int send_topo_data(RealEmu_Device* realemu_device, ChannelCfg channel_cfg){
+    if (realemu_device == NULL) {
+        fprintf(stderr, "Error: Invalid device pointer\n");
+        return -1;
+    }
+
+    int queue_id = 1; // 拓扑数据使用TX队列1
+    RealEmu_Tx_Queue *tx_queue = realemu_device->tx_queue[queue_id];
+    if (tx_queue == NULL) {
+        fprintf(stderr, "Error: TX queue %d not initialized\n", queue_id);
+        return -1;
+    }
+
+    if (tx_queue->count >= REALEMU_QUEUE_DEPTH) {
+        fprintf(stderr, "Error: TX queue %d is full\n", queue_id);
+        return -1;
+    }
+
+    if (pthread_mutex_lock(&tx_queue->lock) != 0) {
+        fprintf(stderr, "Error: Failed to lock TX queue\n");
+        return -1;
+    }
+
+    // 创建并初始化完整的CfgBridge_Topo结构（包含头部）
+    CfgBridge_Topo topo_data;
+    topo_data.channelCfg = channel_cfg;
+    topo_data.bridgeTag.notUsed = 0;
+    topo_data.bridgeTag.control = 1;
+
+    RealEmu_Queue_Data *queue_data = tx_queue->data[tx_queue->head];
+    if (queue_data == NULL) {
+        fprintf(stderr, "Error: Queue data buffer not allocated\n");
+        pthread_mutex_unlock(&tx_queue->lock);
+        return -1;
+    }
+
+    direct_reverse_cfg_bridge_topo_to_buffer(&topo_data, queue_data->buffer);
+
+    tx_queue->head = (tx_queue->head + 1) % REALEMU_QUEUE_DEPTH;
+    tx_queue->count++;
+
+    pthread_mutex_unlock(&tx_queue->lock);
+    return 0;
+}
+
+int send_per_data(RealEmu_Device* realemu_device, PerCfg per_cfg){
+    if (realemu_device == NULL) {
+        fprintf(stderr, "Error: Invalid device pointer\n");
+        return -1;
+    }
+
+    int queue_id = 2; // PER数据使用TX队列2
+    RealEmu_Tx_Queue *tx_queue = realemu_device->tx_queue[queue_id];
+    if (tx_queue == NULL) {
+        fprintf(stderr, "Error: TX queue %d not initialized\n", queue_id);
+        return -1;
+    }
+
+    if (tx_queue->count >= REALEMU_QUEUE_DEPTH) {
+        fprintf(stderr, "Error: TX queue %d is full\n", queue_id);
+        return -1;
+    }
+
+    if (pthread_mutex_lock(&tx_queue->lock) != 0) {
+        fprintf(stderr, "Error: Failed to lock TX queue\n");
+        return -1;
+    }
+
+    // 创建并初始化完整的CfgBridge_Per结构（包含头部）
+    CfgBridge_Per per_data;
+    per_data.perCfg = per_cfg;
+    per_data.bridgeTag.notUsed = 0;
+    per_data.bridgeTag.control = 1;
+
+    RealEmu_Queue_Data *queue_data = tx_queue->data[tx_queue->head];
+    if (queue_data == NULL) {
+        fprintf(stderr, "Error: Queue data buffer not allocated\n");
+        pthread_mutex_unlock(&tx_queue->lock);
+        return -1;
+    }
+
+    direct_reverse_cfg_bridge_per_to_buffer(&per_data, queue_data->buffer);
+
+    tx_queue->head = (tx_queue->head + 1) % REALEMU_QUEUE_DEPTH;
+    tx_queue->count++;
+
+    pthread_mutex_unlock(&tx_queue->lock);
+    return 0;
+}
+
+int realemu_handle_tx_queue(RealEmu_Device* realemu_device){
+    if (realemu_device == NULL) {
+        fprintf(stderr, "Error: Invalid device pointer\n");
+        return -1;
+    }
+
+    int total_sent = 0;
+
+    // 循环轮询三个TX队列
+    for (int qid = 0; qid < REALEMU_TX_QUEUES; qid++) {
+        RealEmu_Tx_Queue *tx_queue = realemu_device->tx_queue[qid];
+        if (tx_queue == NULL) {
+            continue;
+        }
+
+        // 加锁检查队列状态
+        if (pthread_mutex_lock(&tx_queue->lock) != 0) {
+            fprintf(stderr, "Error: Failed to lock TX queue %d\n", qid);
+            continue;
+        }
+
+        // 检查队列中是否有数据
+        while (tx_queue->count > 0) {
+            RealEmu_Queue_Data *queue_data = tx_queue->data[tx_queue->tail];
+            if (queue_data == NULL) {
+                break;
+            }
+
+            // 解锁队列，准备写入H2C设备
+            pthread_mutex_unlock(&tx_queue->lock);
+
+            // 使用dma_with_device函数写入H2C设备
+            ssize_t bytes_written = write_bits_from_host_to_device(
+                realemu_device->xdma_h2c_fd, 
+                (char*)queue_data->buffer, 
+                DATA_WIDTH_BYTE
+            );
+
+            // 重新加锁
+            if (pthread_mutex_lock(&tx_queue->lock) != 0) {
+                fprintf(stderr, "Error: Failed to relock TX queue %d\n", qid);
+                break;
+            }
+
+            if (bytes_written != DATA_WIDTH_BYTE) {
+                fprintf(stderr, "Error: Failed to write to H2C device, wrote %zd bytes\n", bytes_written);
+                tx_queue->xdma_tx_stats.xdma_xmit_err++;
+                break;
+            }
+
+            // 更新队列指针和计数
+            tx_queue->tail = (tx_queue->tail + 1) % REALEMU_QUEUE_DEPTH;
+            tx_queue->count--;
+            tx_queue->xdma_tx_stats.xdma_xmit++;
+            total_sent++;
+        }
+
+        pthread_mutex_unlock(&tx_queue->lock);
+    }
+
+    return total_sent;
+}
+
+int realemu_update_rx_queue(RealEmu_Device* realemu_device){
+    if (realemu_device == NULL) {
+        fprintf(stderr, "Error: Invalid device pointer\n");
+        return -1;
+    }
+
+    int total_received = 0;
+
+    // 循环轮询所有RX队列
+    for (int qid = 0; qid < REALEMU_RX_QUEUES; qid++) {
+        RealEmu_Rx_Queue *rx_queue = realemu_device->rx_queue[qid];
+        if (rx_queue == NULL) {
+            continue;
+        }
+
+        // 加锁检查队列状态
+        if (pthread_mutex_lock(&rx_queue->lock) != 0) {
+            fprintf(stderr, "Error: Failed to lock RX queue %d\n", qid);
+            continue;
+        }
+
+        // 检查队列是否已满
+        if (rx_queue->count >= REALEMU_QUEUE_DEPTH) {
+            pthread_mutex_unlock(&rx_queue->lock);
+            continue;
+        }
+
+        // 解锁队列，准备从C2H设备读取
+        pthread_mutex_unlock(&rx_queue->lock);
+
+        // 使用dma_with_device函数从C2H设备读取数据
+        uint8_t temp_buffer[DATA_WIDTH_BYTE];
+        ssize_t bytes_read = read_bits_from_device_to_host(
+            realemu_device->xdma_c2h_fd, 
+            (char*)temp_buffer, 
+            DATA_WIDTH_BYTE
+        );
+
+        if (bytes_read <= 0) {
+            // 没有数据可读
+            continue;
+        }
+
+        if (bytes_read != DATA_WIDTH_BYTE) {
+            fprintf(stderr, "Error: Incomplete read from C2H device, read %zd bytes\n", bytes_read);
+            rx_queue->xdma_rx_stats.xdma_recv_err++;
+            continue;
+        }
+
+        // 重新加锁
+        if (pthread_mutex_lock(&rx_queue->lock) != 0) {
+            fprintf(stderr, "Error: Failed to relock RX queue %d\n", qid);
+            continue;
+        }
+
+        // 检查队列是否已满（再次检查）
+        if (rx_queue->count >= REALEMU_QUEUE_DEPTH) {
+            pthread_mutex_unlock(&rx_queue->lock);
+            continue;
+        }
+
+        // 将数据存入队列
+        RealEmu_Queue_Data *queue_data = rx_queue->data[rx_queue->head];
+        if (queue_data == NULL) {
+            pthread_mutex_unlock(&rx_queue->lock);
+            continue;
+        }
+
+        memcpy(queue_data->buffer, temp_buffer, DATA_WIDTH_BYTE);
+
+        // 更新队列指针和计数
+        rx_queue->head = (rx_queue->head + 1) % REALEMU_QUEUE_DEPTH;
+        rx_queue->count++;
+        rx_queue->xdma_rx_stats.xdma_recv++;
+        total_received++;
+
+        pthread_mutex_unlock(&rx_queue->lock);
+    }
+
+    return total_received;
+}
+
+int realemu_handle_rx_queue(RealEmu_Device* realemu_device, MacEvent* macevent){
+    if (realemu_device == NULL || macevent == NULL) {
+        fprintf(stderr, "Error: Invalid parameters\n");
+        return -1;
+    }
+
+    // 使用RX队列0（假设数据包接收队列是0）
+    int qid = 0;
+    RealEmu_Rx_Queue *rx_queue = realemu_device->rx_queue[qid];
+    if (rx_queue == NULL) {
+        fprintf(stderr, "Error: RX queue %d not initialized\n", qid);
+        return -1;
+    }
+
+    // 加锁检查队列状态
+    if (pthread_mutex_lock(&rx_queue->lock) != 0) {
+        fprintf(stderr, "Error: Failed to lock RX queue %d\n", qid);
+        return -1;
+    }
+
+    // 检查队列中是否有数据
+    if (rx_queue->count == 0) {
+        pthread_mutex_unlock(&rx_queue->lock);
+        return 0; // 没有数据
+    }
+
+    // 获取队列数据
+    RealEmu_Queue_Data *queue_data = rx_queue->data[rx_queue->tail];
+    if (queue_data == NULL) {
+        pthread_mutex_unlock(&rx_queue->lock);
+        return -1;
+    }
+
+    // 将二进制数据转换为MacEvent结构
+    MacBridge_TOP mac_bridge;
+    buffer_to_mac_bridge(queue_data->buffer, &mac_bridge);
+
+    // 复制MacEvent到输出参数
+    *macevent = mac_bridge.macEvent;
+
+    // 更新队列指针和计数
+    rx_queue->tail = (rx_queue->tail + 1) % REALEMU_QUEUE_DEPTH;
+    rx_queue->count--;
+
+    pthread_mutex_unlock(&rx_queue->lock);
+
+    return 1; // 成功处理一个数据包
+}
+
+int main(){
+    RealEmu_Device *realemu_device = NULL;
+    MacEvent tx_macevent, rx_macevent;
+    int ret;
+
+    // 0. 初始化设备
+    printf("=== 初始化 RealEmu 设备 ===\n");
+    realemu_device = realemu_device_init("/dev/xdma0_h2c_0", "/dev/xdma0_c2h_0", "/dev/xdma0_user");
+    if (realemu_device == NULL) {
+        fprintf(stderr, "Error: Failed to initialize RealEmu device\n");
+        return 1;
+    }
+    printf("设备初始化成功，node_num: %d\n\n", realemu_device->node_num);
+
+    // 寄存器读写测试
+    printf("=== 寄存器读写测试 ===\n");
+    uint32_t retry_limit_value;
+    
+    // 1. 查询节点0中Retry limit的值
+    ret = realemu_read_reg(realemu_device, 0, "RETRY_LIMIT", &retry_limit_value);
+    if (ret != 0) {
+        fprintf(stderr, "Error: Failed to read RETRY_LIMIT register\n");
+    } else {
+        printf("节点0的RETRY_LIMIT寄存器当前值: %u\n", retry_limit_value);
+    }
+    
+    // 2. 把值改成6
+    printf("将RETRY_LIMIT寄存器值设置为6...\n");
+    ret = realemu_write_reg(realemu_device, 0, "RETRY_LIMIT", 6);
+    if (ret != 0) {
+        fprintf(stderr, "Error: Failed to write RETRY_LIMIT register\n");
+    } else {
+        printf("RETRY_LIMIT寄存器写入成功\n");
+    }
+    
+    // 3. 再查一下
+    ret = realemu_read_reg(realemu_device, 0, "RETRY_LIMIT", &retry_limit_value);
+    if (ret != 0) {
+        fprintf(stderr, "Error: Failed to read RETRY_LIMIT register after write\n");
+    } else {
+        printf("节点0的RETRY_LIMIT寄存器新值: %u\n\n", retry_limit_value);
+    }
+
+    // 3. 生成一个数据包
+    printf("=== 生成测试数据包 ===\n");
+    memset(&tx_macevent, 0, sizeof(MacEvent));
+    tx_macevent.status = 1;
+    tx_macevent.mpduDigest.mpducacheaddr = 0x1234567890ABCDEF;
+    tx_macevent.mpduDigest.mpdulen = 1500;
+    tx_macevent.mpduDigest.duration = 2000;
+    tx_macevent.mpduDigest.framesubtype = 0;
+    tx_macevent.mpduDigest.frametype = 2;
+    tx_macevent.rfParam.mcs = 7;
+    tx_macevent.rfParam.power = 1000;
+    tx_macevent.dstMacId = 0;
+    tx_macevent.srcMacId = 1;
+
+    printf("生成的数据包:\n");
+    printf("  status: %u\n", tx_macevent.status);
+    printf("  mpducacheaddr: 0x%lX\n", tx_macevent.mpduDigest.mpducacheaddr);
+    printf("  mpdulen: %u\n", tx_macevent.mpduDigest.mpdulen);
+    printf("  duration: %u\n", tx_macevent.mpduDigest.duration);
+    printf("  framesubtype: %u\n", tx_macevent.mpduDigest.framesubtype);
+    printf("  frametype: %u\n", tx_macevent.mpduDigest.frametype);
+    printf("  mcs: %u\n", tx_macevent.rfParam.mcs);
+    printf("  power: %u\n", tx_macevent.rfParam.power);
+    printf("  dstMacId: %u\n", tx_macevent.dstMacId);
+    printf("  srcMacId: %u\n\n", tx_macevent.srcMacId);
+
+    // 4. 把数据包放到队列
+    printf("=== 将数据包放入TX队列 ===\n");
+    ret = send_pkt_data(realemu_device, tx_macevent);
+    if (ret != 0) {
+        fprintf(stderr, "Error: Failed to send packet data\n");
+        goto cleanup;
+    }
+    printf("数据包成功放入TX队列\n\n");
+
+    // 5. 把队列中的数据发到设备中
+    printf("=== 发送数据到设备 ===\n");
+    int sent_count = realemu_handle_tx_queue(realemu_device);
+    if (sent_count < 0) {
+        fprintf(stderr, "Error: Failed to handle TX queue\n");
+        goto cleanup;
+    }
+    printf("成功发送 %d 个数据包到设备\n\n", sent_count);
+
+    // 6. 从设备中更新rx队列
+    printf("=== 从设备更新RX队列 ===\n");
+    // 等待一小段时间让数据通过设备
+    usleep(10000); // 10ms
+    int received_count = realemu_update_rx_queue(realemu_device);
+    if (received_count < 0) {
+        fprintf(stderr, "Error: Failed to update RX queue\n");
+        goto cleanup;
+    }
+    printf("从设备接收到 %d 个数据包\n\n", received_count);
+
+    // 7. 从rx队列中取出数据并打印
+    printf("=== 从RX队列取出数据 ===\n");
+    ret = realemu_handle_rx_queue(realemu_device, &rx_macevent);
+    if (ret == 0) {
+        printf("RX队列中没有数据\n\n");
+    } else if (ret == 1) {
+        printf("成功从RX队列取出数据:\n");
+        printf("  status: %u\n", rx_macevent.status);
+        printf("  mpducacheaddr: 0x%lX\n", rx_macevent.mpduDigest.mpducacheaddr);
+        printf("  mpdulen: %u\n", rx_macevent.mpduDigest.mpdulen);
+        printf("  duration: %u\n", rx_macevent.mpduDigest.duration);
+        printf("  framesubtype: %u\n", rx_macevent.mpduDigest.framesubtype);
+        printf("  frametype: %u\n", rx_macevent.mpduDigest.frametype);
+        printf("  mcs: %u\n", rx_macevent.rfParam.mcs);
+        printf("  power: %u\n", rx_macevent.rfParam.power);
+        printf("  dstMacId: %u\n", rx_macevent.dstMacId);
+        printf("  srcMacId: %u\n\n", rx_macevent.srcMacId);
+    } else {
+        fprintf(stderr, "Error: Failed to handle RX queue\n");
+        goto cleanup;
+    }
+
+cleanup:
+    // 8. 关闭文件销毁分配的内存空间
+    printf("=== 清理资源 ===\n");
+    if (realemu_device != NULL) {
+        // 关闭文件描述符
+        if (realemu_device->xdma_h2c_fd >= 0) {
+            close(realemu_device->xdma_h2c_fd);
+        }
+        if (realemu_device->xdma_c2h_fd >= 0) {
+            close(realemu_device->xdma_c2h_fd);
+        }
+        if (realemu_device->user_reg_fd >= 0) {
+            close(realemu_device->user_reg_fd);
+        }
+        
+        // 清理TX队列
+        for (int i = 0; i < REALEMU_TX_QUEUES; i++) {
+            if (realemu_device->tx_queue[i] != NULL) {
+                // 清理队列数据
+                for (int j = 0; j < REALEMU_QUEUE_DEPTH; j++) {
+                    if (realemu_device->tx_queue[i]->data[j] != NULL) {
+                        free(realemu_device->tx_queue[i]->data[j]);
+                    }
+                }
+                pthread_mutex_destroy(&realemu_device->tx_queue[i]->lock);
+                free(realemu_device->tx_queue[i]);
+            }
+        }
+        
+        // 清理RX队列
+        for (int i = 0; i < REALEMU_RX_QUEUES; i++) {
+            if (realemu_device->rx_queue[i] != NULL) {
+                // 清理队列数据
+                for (int j = 0; j < REALEMU_QUEUE_DEPTH; j++) {
+                    if (realemu_device->rx_queue[i]->data[j] != NULL) {
+                        free(realemu_device->rx_queue[i]->data[j]);
+                    }
+                }
+                pthread_mutex_destroy(&realemu_device->rx_queue[i]->lock);
+                free(realemu_device->rx_queue[i]);
+            }
+        }
+        
+        free(realemu_device);
+        printf("资源清理完成\n");
+    }
+
     return 0;
 }

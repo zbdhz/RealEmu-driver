@@ -55,7 +55,7 @@ CFLAGS += -DVERSION_STR=$(VERSION_STR)
 LDFLAGS += -lconfig -lpthread
 
 # 需要生成可执行文件的程序
-EXECUTABLES = 
+EXECUTABLES =
 
 # 只需要生成 .o 文件的源文件（不生成可执行文件）
 LIB_OBJS = reg_rw.o dma_with_device.o dma_utils.o
@@ -66,9 +66,14 @@ OBJECTS = $(EXECUTABLES:=.o) $(LIB_OBJS:.c=.o)
 all: $(EXECUTABLES) $(LIB_OBJS:.c=.o)
 
 # 为可执行文件创建链接规则
-$(EXECUTABLES): %: %.o
+dma_test: %: %.o $(LIB_OBJS)
 	@echo "Building $@..."
-	$(CC) -o $@ $< $(LDFLAGS)
+	$(CC) -o $@ $< $(LIB_OBJS) $(LDFLAGS)
+	@echo "$@ built successfully"
+
+cfg_test: cfg_test.o reg_rw.o
+	@echo "Building $@..."
+	$(CC) -o $@ $^ $(LDFLAGS)
 	@echo "$@ built successfully"
 
 # 为库文件创建编译规则
@@ -78,5 +83,5 @@ $(LIB_OBJS): %.o: %.c
 
 clean:
 	@echo "Cleaning $(OBJECTS) $(EXECUTABLES)..."
-	rm -f $(OBJECTS) $(EXECUTABLES)
+	rm -f $(OBJECTS) $(EXECUTABLES) cfg_test.o
 	@echo "Clean completed"

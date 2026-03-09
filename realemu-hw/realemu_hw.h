@@ -5,8 +5,9 @@
 
 
 #define REALEMU_QUEUE_DEPTH 1024
-#define REALEMU_MAX_TX_QUEUES 3
-#define REALEMU_MAX_RX_QUEUES 1
+#define REALEMU_TX_QUEUES 3
+#define REALEMU_RX_QUEUES 1
+
 
 //寄存器相关配置
 
@@ -130,16 +131,15 @@ typedef struct {
 
 // PerCfg 结构体
 typedef struct {
-    uint16_t distance:10;     // 10位 (NodeDistance)
-    uint16_t dstPhyId:10;     // 10位 (PhyId 来自 MacId)
-    uint16_t srcPhyId:10;     // 10位 (PhyId 来自 MacId)
+    uint16_t perIn:14;     
+    uint16_t perOut:16;     
 } PerCfg;
 
 // CfgBridge_Per 结构体
 typedef struct {
-    ChannelCfg channelCfg;
+    PerCfg perCfg;
     BridgeTag bridgeTag;   // BridgeTag 结构体
-} CfgBridge_TOPO;
+} CfgBridge_Per;
 
 
 
@@ -159,39 +159,39 @@ typedef struct realemu_queue_data {
 
 typedef struct realemu_tx_queue {
 //写一个512位（并非字节)缓存器buffer，用于存储待发送的数据包
-    RealEmu_Queue_Data* data[REALEMU_MAX_QUEUE_DEPTH];
+    RealEmu_Queue_Data* data[REALEMU_QUEUE_DEPTH];
     // 队列管理
-    u16 qid;            // 队列ID
-    u16 head;           // 生产者指针
-    u16 tail;           // 消费者指针
-    u16 count;          // 当前队列中的数据数量
-    u32 state;          // 队列状态
+    uint16_t qid;            // 队列ID
+    uint16_t head;           // 生产者指针
+    uint16_t tail;           // 消费者指针
+    uint16_t count;          // 当前队列中的数据数量
+    uint32_t state;          // 队列状态
     
     // 同步机制
     pthread_mutex_t lock;
     // 统计信息
     struct {
-        u64 xdma_xmit;      // XDMA 发送统计
-        u64 xdma_xmit_err;   // XDMA 发送错误统计
+        uint64_t xdma_xmit;      // XDMA 发送统计
+        uint64_t xdma_xmit_err;   // XDMA 发送错误统计
     } xdma_tx_stats;
 } RealEmu_Tx_Queue;
 
 typedef struct realemu_rx_queue {
 //写一个512位的队列，用于存储接收的数据包
-    RealEmu_Queue_Data* data[REALEMU_MAX_QUEUE_DEPTH];
+    RealEmu_Queue_Data* data[REALEMU_QUEUE_DEPTH];
     // 队列管理
-    u16 qid;            // 队列ID
-    u16 head;           // 生产者指针
-    u16 tail;           // 消费者指针
-    u16 count;          // 当前队列中的数据数量
-    u32 state;          // 队列状态
+    uint16_t qid;            // 队列ID
+    uint16_t head;           // 生产者指针
+    uint16_t tail;           // 消费者指针
+    uint16_t count;          // 当前队列中的数据数量
+    uint32_t state;          // 队列状态
     
     // 同步机制
     pthread_mutex_t lock;
     // 统计信息
     struct {
-        u64 xdma_recv;      // XDMA 接收统计
-        u64 xdma_recv_err;   // XDMA 接收错误统计
+        uint64_t xdma_recv;      // XDMA 接收统计
+        uint64_t xdma_recv_err;   // XDMA 接收错误统计
     } xdma_rx_stats;
 } RealEmu_Rx_Queue;
 
@@ -200,25 +200,29 @@ typedef struct realemu_device {
     int xdma_c2h_fd;
     int user_reg_fd;
     int node_num;
-    RealEmu_Tx_Queue *tx_queue[REALEMU_MAX_TX_QUEUES];
-    RealEmu_Rx_Queue *rx_queue[REALEMU_MAX_RX_QUEUES];
+    RealEmu_Tx_Queue *tx_queue[REALEMU_TX_QUEUES];
+    RealEmu_Rx_Queue *rx_queue[REALEMU_RX_QUEUES];
 } RealEmu_Device;
 
 //初始化tx_queue,分配内存空间，把内存空间分配的指针交给realemu_device->tx_queue
-static int realemu_init_tx_queue(struct realemu_device *realemu_device, u16 qid);
+static int realemu_init_tx_queue(RealEmu_Device* realemu_device, uint16_t qid);
 //初始化rx_queue,分配内存空间，把内存空间分配的指针交给realemu_device->rx_queue
-static int realemu_init_rx_queue(struct realemu_device *realemu_device, u16 qid);
-static void realemu_tx_queue_clean(struct realemu_tx_queue *q);//清空tx_queue
-static void realemu_rx_queue_clean(struct realemu_rx_queue *q);//清空rx_queue
+static int realemu_init_rx_queue(RealEmu_Device* realemu_device, uint16_t qid);
+
+static void realemu_tx_queue_clean(RealEmu_Tx_Queue *q);//清空tx_queue
+static void realemu_rx_queue_clean(RealEmu_Rx_Queue *q);//清空rx_queue
 
 
-int realemu_device_init(RealEmu_Device* realemu_device, char *fname, char *fname, char *fname);
+RealEmu_Device* realemu_device_init(char *h2c_dev, char *c2h_dev, char *user_dev);
+
 int send_pkt_data(RealEmu_Device* realemu_device, MacEvent macevent);
-int send_topo_data(RealEmu_Device* realemu_device, CfgBridge_TOPO channelcfg);
-int send_per_data(RealEmu_Device* realemu_device, CfgBridge_TOP percfg);
-int realemu_device_update_tx_queue(RealEmu_Device* realemu_device);
-int realemu_device_update_rx_queue(RealEmu_Device* realemu_device);
-int handle_recv_pkt_data(RealEmu_Device* realemu_device, MacEvent* macevent);
+int send_topo_data(RealEmu_Device* realemu_device, ChannelCfg channel_cfg);
+int send_per_data(RealEmu_Device* realemu_device, PerCfg per_cfg);
 int handle_regacces_request(RealEmu_Device* realemu_device, uint32_t reg_addr, uint32_t* reg_val);
+
+int realemu_handle_tx_queue(RealEmu_Device* realemu_device);
+int realemu_update_rx_queue(RealEmu_Device* realemu_device);
+
+int realemu_handle_rx_queue(RealEmu_Device* realemu_device, MacEvent* macevent);
 int realemu_write_reg(RealEmu_Device* realemu_device, uint32_t node_id, const char *reg_name, uint32_t value);
 int realemu_read_reg(RealEmu_Device* realemu_device, uint32_t node_id, const char *reg_name, uint32_t *value);
