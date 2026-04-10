@@ -175,7 +175,7 @@ void buffer_to_mac_bridge(const uint8_t* buffer, MacBridge_TOP* data) {
     bit_pos += 10;
 }
 
-static int realemu_init_tx_queue(struct realemu_device *realemu_device, uint16_t qid) {
+static int realemu_init_tx_queue(RealEmu_Device* realemu_device, uint16_t qid) {
     if (realemu_device == NULL || qid >= REALEMU_TX_QUEUES) {
         return -1;
     }
@@ -217,7 +217,7 @@ static int realemu_init_tx_queue(struct realemu_device *realemu_device, uint16_t
     return 0;
 }
 
-static int realemu_init_rx_queue(struct realemu_device *realemu_device, uint16_t qid) {
+static int realemu_init_rx_queue(RealEmu_Device* realemu_device, uint16_t qid) {
     if (realemu_device == NULL || qid >= REALEMU_RX_QUEUES) {
         return -1;
     }
@@ -872,6 +872,8 @@ int realemu_handle_rx_queue(RealEmu_Device* realemu_device, MacEvent* macevent){
     return 1; // 成功处理一个数据包
 }
 
+#ifndef BUILD_LIBRARY
+
 int main(){
     RealEmu_Device *realemu_device = NULL;
     MacEvent tx_macevent, rx_macevent;
@@ -1041,3 +1043,5 @@ cleanup:
 
     return 0;
 }
+
+#endif

@@ -1,7 +1,3 @@
-# realemu-hw Makefile
-# RealEmu硬件接口程序
-# 实现与FPGA硬件的交互功能
-
 VERSION_STR="\"1.0\""
 
 # CC = gcc
@@ -54,42 +50,17 @@ CFLAGS += $(shell $(PKG_CONFIG) --cflags $(NLLIBNAME))
 CFLAGS += -DVERSION_STR=$(VERSION_STR)
 LDFLAGS += -lconfig -lpthread
 
-# 添加头文件搜索路径
-CFLAGS += -I../include
-CFLAGS += -I../tools
+TARGET = realwmediumd
+OBJECTS= realwmediumd.o
 
-# 需要生成可执行文件的程序
-EXECUTABLES = test_throughput
+all: $(TARGET)
 
-# 只需要生成 .o 文件的源文件（不生成可执行文件）
-LIB_OBJS = realemu_hw.o
-
-# 依赖的 tools 目录中的目标文件
-TOOLS_OBJS = ../tools/reg_rw.o ../tools/dma_with_device.o ../tools/dma_utils.o
-
-# 所有目标文件
-OBJECTS = $(LIB_OBJS) $(TOOLS_OBJS)
-
-all: $(EXECUTABLES)
-
-test_rtt: realemu_hw.o test_rtt.o $(TOOLS_OBJS)
-	$(CC) -o $@ realemu_hw.o test_rtt.o $(TOOLS_OBJS) $(LDFLAGS)
-
-test_throughput: realemu_hw.o test_throughput.o $(TOOLS_OBJS)
-	$(CC) -o $@ realemu_hw.o test_throughput.o $(TOOLS_OBJS) $(LDFLAGS)
-
-$(LIB_OBJS): %.o: %.c
-	@echo "Compiling $<..."
-	$(CC) $(CFLAGS) -DBUILD_LIBRARY -c -o $@ $<
-
-test_rtt.o: test_rtt.c
-	@echo "Compiling $<..."
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-test_throughput.o: test_throughput.c
-	@echo "Compiling $<..."
-	$(CC) $(CFLAGS) -c -o $@ $<
+$(TARGET): $(OBJECTS)
+	@echo "Building $(TARGET)..."
+	$(CC) -o $@ $(OBJECTS) $(LDFLAGS)
+	@echo "$(TARGET) built successfully"
 
 clean:
-	@echo "Cleaning..."
-	rm -f $(LIB_OBJS) test_rtt test_throughput
+	@echo "Cleaning $(OBJECTS) $(TARGET)..."
+	rm -f $(OBJECTS) $(TARGET)
+	@echo "Clean completed"

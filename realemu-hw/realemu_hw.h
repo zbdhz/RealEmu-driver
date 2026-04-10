@@ -204,13 +204,13 @@ typedef struct realemu_device {
     RealEmu_Rx_Queue *rx_queue[REALEMU_RX_QUEUES];
 } RealEmu_Device;
 
-//初始化tx_queue,分配内存空间，把内存空间分配的指针交给realemu_device->tx_queue
-static int realemu_init_tx_queue(RealEmu_Device* realemu_device, uint16_t qid);
-//初始化rx_queue,分配内存空间，把内存空间分配的指针交给realemu_device->rx_queue
-static int realemu_init_rx_queue(RealEmu_Device* realemu_device, uint16_t qid);
+// //初始化tx_queue,分配内存空间，把内存空间分配的指针交给realemu_device->tx_queue
+// static int realemu_init_tx_queue(RealEmu_Device* realemu_device, uint16_t qid);
+// //初始化rx_queue,分配内存空间，把内存空间分配的指针交给realemu_device->rx_queue
+// static int realemu_init_rx_queue(RealEmu_Device* realemu_device, uint16_t qid);
 
-static void realemu_tx_queue_clean(RealEmu_Tx_Queue *q);//清空tx_queue
-static void realemu_rx_queue_clean(RealEmu_Rx_Queue *q);//清空rx_queue
+// static void realemu_tx_queue_clean(RealEmu_Tx_Queue *q);//清空tx_queue
+// static void realemu_rx_queue_clean(RealEmu_Rx_Queue *q);//清空rx_queue
 
 
 RealEmu_Device* realemu_device_init(char *h2c_dev, char *c2h_dev, char *user_dev);

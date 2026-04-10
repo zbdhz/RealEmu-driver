@@ -15,7 +15,6 @@
 *.dylib
 
 # 可执行文件
-realwmediumd
 reg_rw
 dma_to_device
 dma_from_device
