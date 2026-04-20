@@ -21,11 +21,11 @@
 #ifndef WMEDIUMD_SERVER_H
 #define WMEDIUMD_SERVER_H
 
-#include "wmediumd.h"
+#include "realwmediumd.h"
 #include "wserver_messages.h"
 
 struct request_ctx {
-    struct wmediumd *ctx;
+    struct realwmediumd *ctx;
     int sock_fd;
 };
 

@@ -104,7 +104,7 @@ void *node0_tx_thread_func(void *arg) {
         tx_macevent.srcMacId = 0;
 
         // 发送数据包
-        int ret = send_pkt_data(realemu_device, tx_macevent);
+        int ret = realemu_send_pkt_data(realemu_device, tx_macevent);
         if (ret == 0) {
             realemu_handle_tx_queue(realemu_device);
             
@@ -328,7 +328,7 @@ int main() {
                 channel_cfg.srcPhyId = src;
                 channel_cfg.dstPhyId = dst;
                 channel_cfg.distance = DEFAULT_DISTANCE;
-                send_topo_data(realemu_device, channel_cfg);
+                realemu_send_topo_data(realemu_device, channel_cfg);
             }
         }
     }
@@ -337,12 +337,12 @@ int main() {
     channel_cfg.srcPhyId = 0;
     channel_cfg.dstPhyId = 1;
     channel_cfg.distance = TEST_DISTANCE;
-    send_topo_data(realemu_device, channel_cfg);
+    realemu_send_topo_data(realemu_device, channel_cfg);
 
     channel_cfg.srcPhyId = 1;
     channel_cfg.dstPhyId = 0;
     channel_cfg.distance = TEST_DISTANCE;
-    send_topo_data(realemu_device, channel_cfg);
+    realemu_send_topo_data(realemu_device, channel_cfg);
 
     realemu_handle_tx_queue(realemu_device);
     printf("拓扑配置完成\n\n");

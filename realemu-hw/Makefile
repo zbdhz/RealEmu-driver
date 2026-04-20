@@ -58,29 +58,30 @@ LDFLAGS += -lconfig -lpthread
 CFLAGS += -I../include
 CFLAGS += -I../tools
 
-# 需要生成可执行文件的程序
-EXECUTABLES = test_throughput
-
 # 只需要生成 .o 文件的源文件（不生成可执行文件）
 LIB_OBJS = realemu_hw.o
 
-# 依赖的 tools 目录中的目标文件
-TOOLS_OBJS = ../tools/reg_rw.o ../tools/dma_with_device.o ../tools/dma_utils.o
-
 # 所有目标文件
-OBJECTS = $(LIB_OBJS) $(TOOLS_OBJS)
+OBJECTS = $(LIB_OBJS)
 
-all: $(EXECUTABLES)
+# 默认只生成库对象文件
+all: $(LIB_OBJS)
 
-test_rtt: realemu_hw.o test_rtt.o $(TOOLS_OBJS)
-	$(CC) -o $@ realemu_hw.o test_rtt.o $(TOOLS_OBJS) $(LDFLAGS)
-
-test_throughput: realemu_hw.o test_throughput.o $(TOOLS_OBJS)
-	$(CC) -o $@ realemu_hw.o test_throughput.o $(TOOLS_OBJS) $(LDFLAGS)
-
+# 库对象文件编译规则
 $(LIB_OBJS): %.o: %.c
 	@echo "Compiling $<..."
 	$(CC) $(CFLAGS) -DBUILD_LIBRARY -c -o $@ $<
+
+# 可选的测试程序（需要显式指定）
+test_rtt: realemu_hw.o test_rtt.o
+	@echo "Building test_rtt..."
+	$(CC) -o $@ realemu_hw.o test_rtt.o $(LDFLAGS)
+	@echo "test_rtt built successfully"
+
+test_throughput: realemu_hw.o test_throughput.o
+	@echo "Building test_throughput..."
+	$(CC) -o $@ realemu_hw.o test_throughput.o $(LDFLAGS)
+	@echo "test_throughput built successfully"
 
 test_rtt.o: test_rtt.c
 	@echo "Compiling $<..."
@@ -91,5 +92,6 @@ test_throughput.o: test_throughput.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	@echo "Cleaning..."
-	rm -f $(LIB_OBJS) test_rtt test_throughput
+	@echo "Cleaning realemu-hw..."
+	rm -f $(OBJECTS) test_rtt test_throughput test_rtt.o test_throughput.o
+	@echo "Clean completed"

@@ -24,6 +24,15 @@
 #ifndef REALWMEDIUMD_H_
 #define REALWMEDIUMD_H_
 
+/* Forward declaration from realemu-hw */
+typedef struct realemu_device RealEmu_Device;
+
+/* Operation mode for realwmediumd */
+enum En_OperationMode {
+	LOCAL,
+	REMOTE
+};
+
 #define HWSIM_TX_CTL_REQ_TX_STATUS	1
 #define HWSIM_TX_CTL_NO_ACK		(1 << 1)
 #define HWSIM_TX_STAT_ACK		(1 << 2)
@@ -113,22 +122,57 @@ enum {
 #include <stdbool.h>
 #include <syslog.h>
 #include <stdio.h>
+#include <event.h>
 
 #include "list.h"
 #include "ieee80211.h"
+#include "../realemu-hw/realemu_hw.h"
 
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
+#define MAC_FMT "%02x:%02x:%02x:%02x:%02x:%02x"
+#define MAC_ARGS(a) a[0],a[1],a[2],a[3],a[4],a[5]
 
+#define TIME_FMT "%lld.%06lld"
+#define TIME_ARGS(a) ((unsigned long long)(a)->tv_sec), ((unsigned long long)(a)->tv_nsec/1000)
 
+#define NOISE_LEVEL	(-91)
+#define CCA_THRESHOLD	(-90)
+#define ENABLE_MEDIUM_DETECTION	true
 
+#ifndef min
+#define min(x,y) ((x) < (y) ? (x) : (y))
+#endif
 
 struct wqueue {
 	struct list_head frames;
 	int cw_min;
 	int cw_max;
+};
+
+/* hwsim transmit rate structure */
+struct hwsim_tx_rate {
+	signed char idx;
+	unsigned char count;
+};
+
+/* frame structure - represents a wireless frame in the simulation */
+struct frame {
+	struct list_head list;		/* frame queue list */
+	struct timespec expires;	/* frame delivery (absolute) */
+	bool acked;
+	u64 cookie;
+	u32 freq;
+	int flags;
+	int signal;
+	int duration;
+	int tx_rates_count;
+	struct station *sender;
+	struct hwsim_tx_rate tx_rates[IEEE80211_TX_MAX_RATES];
+	size_t data_len;
+	u8 data[0];				/* frame contents (flexible array) */
 };
 
 struct station {
@@ -152,6 +196,30 @@ struct intf_info {
 	int signal;
 	int duration;
 	double prob_col;
+};
+
+struct log_distance_model_param {
+	double path_loss_exponent;
+	double Xg;
+};
+
+struct itu_model_param {
+	int nFLOORS;
+	int lF;
+	int pL;
+};
+
+struct log_normal_shadowing_model_param {
+	int sL;
+	double path_loss_exponent;
+};
+
+struct free_space_model_param {
+	int sL;
+};
+
+struct two_ray_ground_model_param {
+	int sL;
 };
 
 struct realwmediumd {
@@ -180,7 +248,9 @@ struct realwmediumd {
 
 	struct nl_cb *cb;
 	int family_id;
-	struct RealEmu_Device* realemu_device;
+	RealEmu_Device* realemu_device;
+	struct event rx_ev;  /* event for realemu RX eventfd */
+	struct event ev_cmd; /* event for netlink socket */
 
 	int (*get_link_snr)(struct realwmediumd *, struct station *,
 			    struct station *);
@@ -193,3 +263,21 @@ struct realwmediumd {
 
 	uint8_t log_lvl;
 };
+
+/* Function declarations from wmediumd */
+int index_to_rate(size_t index, u32 freq);
+bool is_multicast_ether_addr(const u8 *addr);
+void detect_mediums(struct realwmediumd *ctx, struct station *src, struct station *dest);
+int get_signal_offset_by_interference(struct realwmediumd *ctx, int src_idx, int dst_idx);
+bool set_interference_duration(struct realwmediumd *ctx, int src_idx, int duration, int signal);
+void station_init_queues(struct station *station);
+double get_error_prob_from_snr(double snr, unsigned int rate_idx, u32 freq,
+			       int frame_len);
+int set_default_per(struct realwmediumd *ctx);
+int read_per_file(struct realwmediumd *ctx, const char *file_name);
+void timespec_add_usec(struct timespec *ts, int usec);
+bool timespec_before(struct timespec *t1, struct timespec *t2);
+int w_logf(struct realwmediumd *ctx, u8 level, const char *format, ...);
+int w_flogf(struct realwmediumd *ctx, u8 level, FILE *stream, const char *format, ...);
+
+#endif /* REALWMEDIUMD_H_ */

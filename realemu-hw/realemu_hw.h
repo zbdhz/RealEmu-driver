@@ -1,7 +1,10 @@
+#ifndef REALEMU_HW_H_
+#define REALEMU_HW_H_
+
 #include <stdint.h>
 #include <stddef.h>
 
-#include "realemu_top.h"
+#include "../include/realemu_top.h"
 
 
 #define REALEMU_QUEUE_DEPTH 1024
@@ -151,7 +154,7 @@ void set_bits(uint8_t* buffer, size_t start_bit, size_t num_bits, uint64_t value
 void direct_reverse_mac_bridge_to_buffer(const MacBridge_TOP* data, uint8_t* buffer);
 void direct_reverse_cfg_bridge_topo_to_buffer(const CfgBridge_Topo* data, uint8_t* buffer);
 void direct_reverse_cfg_bridge_per_to_buffer(const CfgBridge_Per* data, uint8_t* buffer);
-void buffer_to_mac_bridge(const uint8_t* buffer, MacBridge_TOP* data);
+void buffer_to_mac_event(const uint8_t* buffer, MacEvent* data);
 
 typedef struct realemu_queue_data {
     uint8_t buffer[DATA_WIDTH_BYTE];
@@ -202,6 +205,21 @@ typedef struct realemu_device {
     int node_num;
     RealEmu_Tx_Queue *tx_queue[REALEMU_TX_QUEUES];
     RealEmu_Rx_Queue *rx_queue[REALEMU_RX_QUEUES];
+    
+    // 设备级别的互斥锁，保护设备文件描述符的并发访问
+    pthread_mutex_t h2c_lock;      // H2C 设备访问锁
+    pthread_mutex_t c2h_lock;      // C2H 设备访问锁
+    
+    // RX 轮询线程相关字段
+    pthread_t rx_poll_thread;      // RX 轮询线程
+    int rx_poll_running;           // 轮询线程运行标志
+    pthread_mutex_t rx_lock;       // RX 同步互斥锁
+    pthread_cond_t rx_cond;        // RX 同步条件变量
+    int rx_eventfd;                // eventfd 用于通知外部模块有数据到达
+
+    // TX flush 线程：持续把软件 TX 队列下发到 H2C
+    pthread_t tx_flush_thread;
+    int tx_flush_running;
 } RealEmu_Device;
 
 // //初始化tx_queue,分配内存空间，把内存空间分配的指针交给realemu_device->tx_queue
@@ -214,15 +232,18 @@ typedef struct realemu_device {
 
 
 RealEmu_Device* realemu_device_init(char *h2c_dev, char *c2h_dev, char *user_dev);
+void realemu_device_cleanup(RealEmu_Device* realemu_device);
 
-int send_pkt_data(RealEmu_Device* realemu_device, MacEvent macevent);
-int send_topo_data(RealEmu_Device* realemu_device, ChannelCfg channel_cfg);
-int send_per_data(RealEmu_Device* realemu_device, PerCfg per_cfg);
-int handle_regacces_request(RealEmu_Device* realemu_device, uint32_t reg_addr, uint32_t* reg_val);
+int realemu_send_pkt_data(RealEmu_Device* realemu_device, MacEvent macevent);
+int realemu_send_topo_data(RealEmu_Device* realemu_device, ChannelCfg channel_cfg);
+int realemu_send_per_data(RealEmu_Device* realemu_device, PerCfg per_cfg);
+// int handle_regacces_request(RealEmu_Device* realemu_device, uint32_t reg_addr, uint32_t* reg_val);
 
 int realemu_handle_tx_queue(RealEmu_Device* realemu_device);
-int realemu_update_rx_queue(RealEmu_Device* realemu_device);
+int realemu_get_rx_eventfd(RealEmu_Device* realemu_device);
 
 int realemu_handle_rx_queue(RealEmu_Device* realemu_device, MacEvent* macevent);
 int realemu_write_reg(RealEmu_Device* realemu_device, uint32_t node_id, const char *reg_name, uint32_t value);
 int realemu_read_reg(RealEmu_Device* realemu_device, uint32_t node_id, const char *reg_name, uint32_t *value);
+
+#endif /* REALEMU_HW_H_ */

@@ -17,6 +17,8 @@
 #include "ieee80211.h"
 #include "realwmediumd.h"
 #include "config.h"
+#include "wserver.h"
+#include "../realemu-hw/realemu_hw.h"
 
 struct sockaddr_in serverAddr, clientAddr;
 socklen_t len;
@@ -24,12 +26,19 @@ void* out_buf;
 char in_buf[PAGE_SIZE];
 static bool is_ap = true;
 
+#define HW_UNICAST_TIMEOUT_USEC 100000
+
+static int send_tx_info_frame(struct realwmediumd *ctx, struct frame *frame);
+int send_cloned_frame_msg(struct realwmediumd *ctx, struct station *dst,
+			  u8 *data, int data_len, int rate_idx, int signal,
+			  int freq);
+
 static inline int div_round(int a, int b)
 {
 	return (a + b - 1) / b;
 }
 
-static inline int pkt_duration(struct realwmediumd *ctx, int len, int rate)
+int pkt_duration(struct realwmediumd *ctx, int len, int rate)
 {
 	/* preamble + signal + t_sym * n_sym, rate in 100 kbps */
 	return 16 + 4 + 4 * div_round((16 + 8 * len + 6) * 10, 4 * rate);
@@ -194,6 +203,107 @@ static enum ieee80211_ac_number frame_select_queue_80211(struct frame *frame)
 	return ieee802_1d_to_ac[priority];
 }
 
+static double dBm_to_milliwatt(int decibel_intf)
+{
+#define INTF_LIMIT (31)
+	int intf_diff = NOISE_LEVEL - decibel_intf;
+
+	if (intf_diff >= INTF_LIMIT)
+		return 0.001;
+
+	if (intf_diff <= -INTF_LIMIT)
+		return 1000.0;
+
+	return pow(10.0, -intf_diff / 10.0);
+}
+
+static double milliwatt_to_dBm(double value)
+{
+	return 10.0 * log10(value);
+}
+
+bool set_interference_duration(struct realwmediumd *ctx, int src_idx,
+				      int duration, int signal)
+{
+	int i, medium_id;
+
+	if (!ctx->intf)
+		return 0;
+
+	if (signal >= CCA_THRESHOLD)
+		return 0;
+
+	medium_id = ctx->sta_array[src_idx]->medium_id;
+	for (i = 0; i < ctx->num_stas; i++) {
+		if (medium_id != ctx->sta_array[i]->medium_id)
+			continue;
+		ctx->intf[ctx->num_stas * src_idx + i].duration += duration;
+		ctx->intf[ctx->num_stas * src_idx + i].signal = signal;
+	}
+
+	return 1;
+}
+
+int get_signal_offset_by_interference(struct realwmediumd *ctx, int src_idx,
+					      int dst_idx)
+{
+	int i, medium_id;
+	double intf_power;
+
+	if (!ctx->intf)
+		return 0;
+
+	intf_power = 0.0;
+	medium_id = ctx->sta_array[dst_idx]->medium_id;
+	for (i = 0; i < ctx->num_stas; i++) {
+		if (i == src_idx || i == dst_idx)
+			continue;
+		if (medium_id != ctx->sta_array[i]->medium_id)
+			continue;
+		if (drand48() < ctx->intf[i * ctx->num_stas + dst_idx].prob_col)
+			intf_power += dBm_to_milliwatt(
+				ctx->intf[i * ctx->num_stas + dst_idx].signal);
+	}
+
+	if (intf_power <= 1.0)
+		return 0;
+
+	return (int)(milliwatt_to_dBm(intf_power) + 0.5);
+}
+
+bool is_multicast_ether_addr(const u8 *addr)
+{
+	return 0x01 & addr[0];
+}
+
+void detect_mediums(struct realwmediumd *ctx, struct station *src, struct station *dest)
+{
+	int medium_id;
+
+	if (!ctx->enable_medium_detection)
+		return;
+
+	if (src->isap & !dest->isap) {
+		medium_id = -src->index - 1;
+	} else if ((!src->isap) & dest->isap) {
+		medium_id = -dest->index - 1;
+	} else {
+		return;
+	}
+
+	if (medium_id != src->medium_id) {
+		w_logf(ctx, LOG_DEBUG, "Setting medium id of " MAC_FMT "(%d|%s) to %d.\n",
+		       MAC_ARGS(src->addr), src->index, src->isap ? "AP" : "Sta", medium_id);
+		src->medium_id = medium_id;
+	}
+
+	if (medium_id != dest->medium_id) {
+		w_logf(ctx, LOG_DEBUG, "Setting medium id of " MAC_FMT "(%d|%s) to %d.\n",
+		       MAC_ARGS(dest->addr), dest->index, dest->isap ? "AP" : "Sta", medium_id);
+		dest->medium_id = medium_id;
+	}
+}
+
 static struct station *get_station_by_addr(struct realwmediumd *ctx, u8 *addr)
 {
 	struct station *station;
@@ -203,6 +313,191 @@ static struct station *get_station_by_addr(struct realwmediumd *ctx, u8 *addr)
 			return station;
 	}
 	return NULL;
+}
+
+/*
+ * Get hardware node_id from station structure
+ * Maps station->index directly to node_id (0, 1, 2...)
+ */
+static inline int get_node_id_by_station(const struct station *sta)
+{
+	if (!sta)
+		return -1;
+	return sta->index;
+}
+
+/*
+ * Get station structure from hardware node_id
+ * Reverse mapping: node_id -> sta_array[node_id]
+ */
+static struct station *get_station_by_node_id(struct realwmediumd *ctx, int node_id)
+{
+	if (node_id < 0 || node_id >= ctx->num_stas)
+		return NULL;
+	if (node_id >= NODE_NUM) {
+		w_logf(ctx, LOG_ERR, "node_id %d exceeds hardware limit %d\n",
+		       node_id, NODE_NUM);
+		return NULL;
+	}
+	return ctx->sta_array[node_id];
+}
+
+/*
+ * Get hardware node_id from MAC address
+ * MAC addr -> station -> node_id
+ */
+static int get_node_id_by_addr(struct realwmediumd *ctx, const u8 *addr)
+{
+	struct station *sta = get_station_by_addr(ctx, (u8 *)addr);
+	if (!sta)
+		return -1;
+
+	if (sta->index >= NODE_NUM) {
+		w_logf(ctx, LOG_ERR, "Station " MAC_FMT " index %d exceeds hardware limit\n",
+		       MAC_ARGS(addr), sta->index);
+		return -1;
+	}
+	return sta->index;
+}
+
+/*
+ * Validate if station can be mapped to hardware
+ * Check if station index is within hardware node range
+ */
+static bool is_station_valid_for_hw(struct realwmediumd *ctx, const struct station *sta)
+{
+	return sta && sta->index >= 0 && sta->index < NODE_NUM;
+}
+
+/* Find and detach a queued frame by cookie from all station AC queues. */
+static struct frame *dequeue_frame_by_cookie(struct realwmediumd *ctx, u64 cookie)
+{
+	struct station *station;
+	int i;
+
+	list_for_each_entry(station, &ctx->stations, list) {
+		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+			struct frame *frame;
+			list_for_each_entry(frame, &station->queues[i].frames, list) {
+				if (frame->cookie == cookie) {
+					list_del(&frame->list);
+					return frame;
+				}
+			}
+		}
+	}
+
+	return NULL;
+}
+
+/* Complete one unicast frame using hardware ACK semantics. */
+static void complete_unicast_hw_success(struct realwmediumd *ctx,
+					      struct frame *frame)
+{
+	struct ieee80211_hdr *hdr;
+	struct station *dst_sta;
+	u8 *dest;
+	int rate_idx;
+
+	if (!frame)
+		return;
+
+	hdr = (struct ieee80211_hdr *)frame->data;
+	dest = hdr->addr1;
+	dst_sta = get_station_by_addr(ctx, dest);
+
+	frame->flags |= HWSIM_TX_STAT_ACK;
+	rate_idx = (frame->tx_rates_count > 0) ? frame->tx_rates[0].idx : 0;
+	if (rate_idx < 0)
+		rate_idx = 0;
+
+	if (dst_sta) {
+		send_cloned_frame_msg(ctx, dst_sta,
+				      frame->data,
+				      frame->data_len,
+				      rate_idx,
+				      frame->signal,
+				      frame->freq);
+	}
+
+	send_tx_info_frame(ctx, frame);
+	free(frame);
+}
+
+/*
+ * Send a frame to the RealEmu hardware
+ * Converts hwsim frame to MacEvent and queues it for transmission
+ */
+static int send_frame_to_hardware(struct realwmediumd *ctx, struct station *sender,
+				  struct frame *frame)
+{
+	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)frame->data;
+	u8 *dest = hdr->addr1;
+	MacEvent macevent;
+	int src_node, dst_node;
+	int ret;
+
+	/* Get source node ID from sender station */
+	src_node = get_node_id_by_station(sender);
+	if (src_node < 0) {
+		w_logf(ctx, LOG_ERR, "Failed to get node_id for sender station\n");
+		return -1;
+	}
+
+	/* Get destination node ID from destination MAC address */
+	dst_node = get_node_id_by_addr(ctx, dest);
+	if (dst_node < 0) {
+		w_logf(ctx, LOG_DEBUG, "Destination " MAC_FMT " not in our network, dropping\n",
+		       MAC_ARGS(dest));
+		return 0;  /* Silently drop frames to external stations */
+	}
+
+	/* Validate both nodes are within hardware limits */
+	if (src_node >= NODE_NUM || dst_node >= NODE_NUM) {
+		w_logf(ctx, LOG_ERR, "Node IDs %d->%d exceed hardware limit %d\n",
+		       src_node, dst_node, NODE_NUM);
+		return -1;
+	}
+
+	/* Initialize MacEvent */
+	memset(&macevent, 0, sizeof(MacEvent));
+
+	/* Fill in MacEvent fields */
+	macevent.status = 1;  /* Frame is valid */
+	macevent.srcMacId = src_node;
+	macevent.dstMacId = dst_node;
+
+	/* Fill mpduDigest */
+	macevent.mpduDigest.mpducacheaddr = frame->cookie;  /* Use cookie as cache identifier */
+	macevent.mpduDigest.mpdulen = frame->data_len;
+	macevent.mpduDigest.duration = frame->duration;
+ 
+	/* Extract frame type and subtype from frame_control */
+	macevent.mpduDigest.frametype = (hdr->frame_control[0] & FCTL_FTYPE) >> 2;
+	macevent.mpduDigest.framesubtype = (hdr->frame_control[0] & 0xf0) >> 4;
+
+	/* Fill RF parameters from frame
+	 * 5GHz OFDM: rate idx 0-7 maps to MCS 0-7
+	 * idx: 0=6M, 1=9M, 2=12M, 3=18M, 4=24M, 5=36M, 6=48M, 7=54M
+	 */
+	if (frame->tx_rates_count > 0 && frame->tx_rates[0].idx >= 0) {
+		macevent.rfParam.mcs = frame->tx_rates[0].idx & 0x07;  /* 5GHz OFDM: idx 0-7 -> MCS 0-7 */
+	} else {
+		macevent.rfParam.mcs = 0;  /* Default to 6 Mbps (idx 0) */
+	}
+	macevent.rfParam.power = 2000;  /* Default power (arbitrary value for now) */
+
+	/* Send to hardware */
+	ret = realemu_send_pkt_data(ctx->realemu_device, macevent);
+	if (ret < 0) {
+		w_logf(ctx, LOG_ERR, "Failed to send packet to hardware: %d\n", ret);
+		return -1;
+	}
+
+	w_logf(ctx, LOG_DEBUG, "Frame sent to hardware: %d->%d, len=%zu, cookie=%llu\n",
+	       src_node, dst_node, frame->data_len, (unsigned long long)frame->cookie);
+
+	return 0;
 }
 
 //重写该函数
@@ -216,6 +511,8 @@ void queue_frame(struct realwmediumd *ctx, struct station *station,
 	struct ieee80211_hdr *hdr = (void *)frame->data;	/* hdr：802.11 帧头 */
 	u8 *dest = hdr->addr1;					/* dest：目标 MAC 地址 */
 	struct timespec now, target;				/* now / target：时间相关变量 */
+	int ret;
+	bool is_mcast;
 	struct wqueue *queue;					/* queue：帧队列 */
 	struct frame *tail;					/* tail：队列末尾帧指针 */
 	struct station *tmpsta, *deststa;			/* deststa：目标站点 */
@@ -237,6 +534,28 @@ void queue_frame(struct realwmediumd *ctx, struct station *station,
 	int retries = 0;  /* 重试次数计数器 */
 
 	clock_gettime(CLOCK_MONOTONIC, &now);  //获取当前时间 ：使用单调时钟获取当前时间，用于计算帧的过期时间
+	is_mcast = is_multicast_ether_addr(dest);
+
+	/* 单播统一走硬件判决：默认失败，超时前若收到硬件回执再转成功。 */
+	if (!is_mcast) {
+		ret = send_frame_to_hardware(ctx, station, frame);
+		if (ret < 0)
+			w_logf(ctx, LOG_ERR, "Failed to enqueue unicast frame to hardware, waiting timeout as failed\n");
+
+		frame->flags &= ~HWSIM_TX_STAT_ACK;
+		frame->duration = HW_UNICAST_TIMEOUT_USEC;
+		frame->signal = SNR_DEFAULT + NOISE_LEVEL;
+		target = now;
+		timespec_add_usec(&target, HW_UNICAST_TIMEOUT_USEC);
+		frame->expires = target;
+
+		ac = frame_select_queue_80211(frame);
+		queue = &station->queues[ac];
+		list_add_tail(&frame->list, &queue->frames);
+		rearm_timer(ctx);
+		return;
+	}
+
 	//算 ACK 时间 ：计算 ACK 帧的传输时间（14字节）加上 SIFS 时间
 	int ack_time_usec = pkt_duration(ctx, 14, index_to_rate(0, frame->freq)) +
 			sifs;
@@ -259,7 +578,7 @@ void queue_frame(struct realwmediumd *ctx, struct station *station,
 
 	int snr = SNR_DEFAULT;
 
-	if (is_multicast_ether_addr(dest)) {
+	if (is_mcast) {
 		deststa = NULL;
 	} else {
 		deststa = get_station_by_addr(ctx, dest);
@@ -276,7 +595,7 @@ void queue_frame(struct realwmediumd *ctx, struct station *station,
 	}
 	frame->signal = snr + NOISE_LEVEL;
 
-	noack = frame_is_mgmt(frame) || is_multicast_ether_addr(dest);
+	noack = frame_is_mgmt(frame) || is_mcast;
 	double choice = -3.14;
 
 	if (use_fixed_random_value(ctx))
@@ -343,7 +662,7 @@ void queue_frame(struct realwmediumd *ctx, struct station *station,
 	// - 检查这些站点的同优先级或更高优先级队列
 	// - 如果队列中有帧，取最后一个帧的过期时间作为当前帧的开始时间
     w_logf(ctx, LOG_DEBUG, "Sta " MAC_FMT " medium is #%d\n", MAC_ARGS(station->addr), station->medium_id);
-    list_for_each_entry(tmpsta, &ctx->stations, list) {
+	list_for_each_entry(tmpsta, &ctx->stations, list) {
         if (station->medium_id == tmpsta->medium_id) {
             w_logf(ctx, LOG_DEBUG, "Sta " MAC_FMT " medium is also #%d\n", MAC_ARGS(tmpsta->addr),
                    tmpsta->medium_id);
@@ -769,6 +1088,15 @@ out:
 }
 
 /*
+ * Callback for netlink socket events - triggered when kernel sends data
+ */
+static void sock_event_cb(int fd, short what, void *data)
+{
+	struct realwmediumd *ctx = data;
+	nl_recvmsgs_default(ctx->sock);
+}
+
+/*
  * Handle events from the kernel.  Process CMD_FRAME events and queue them
  * for later delivery with the scheduler.
  * 说明该函数的作用是处理来自内核的事件，特别是处理 CMD_FRAME 事件并将它们排队以便稍后由调度器传递
@@ -811,12 +1139,50 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 	// 	if (tx_frame != NULL)
 	// 		list_add_tail(&tx_frame->list, &ctx->pending_txinfo_frames);
 
-	// out:
-	// 	free(out_buf);
-	// 	return ret;
+	return 0;
 }
 
+/* Register with kernel to start receiving frames from mac80211_hwsim. */
+static int send_register_msg(struct realwmediumd *ctx)
+{
+	struct nl_sock *sock = ctx->sock;
+	struct nl_msg *msg;
+	int ret;
 
+	msg = nlmsg_alloc();
+	if (!msg) {
+		w_logf(ctx, LOG_ERR, "Error allocating register message\n");
+		return -1;
+	}
+
+	if (genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, ctx->family_id,
+			0, NLM_F_REQUEST, HWSIM_CMD_REGISTER,
+			VERSION_NR) == NULL) {
+		w_logf(ctx, LOG_ERR, "%s: genlmsg_put failed\n", __func__);
+		ret = -1;
+		goto out;
+	}
+
+	ret = nl_send_auto_complete(sock, msg);
+	if (ret < 0) {
+		w_logf(ctx, LOG_ERR, "%s: nl_send_auto failed\n", __func__);
+		ret = -1;
+		goto out;
+	}
+
+	ret = 0;
+out:
+	nlmsg_free(msg);
+	return ret;
+}
+
+/*
+ * Netlink error callback
+ */
+static int nl_err_cb(struct sockaddr_nl *nla, struct nlmsgerr *nlerr, void *arg)
+{
+	return NL_OK;
+}
 
 /*
  * Setup netlink socket and callbacks.
@@ -906,11 +1272,78 @@ static void timer_cb(int fd, short what, void *data)
 	// pthread_rwlock_unlock(&snr_lock);
 }
 
+/* Callback for realemu RX eventfd - triggered when hardware has data available */
+static void realemu_rx_event_callback(int fd, short what, void *data)
+{
+	struct realwmediumd *ctx = data;
+	uint64_t u;
+	MacEvent macevent;
+	struct frame *frame;
+	u64 cookie;
+
+	/* Clear the eventfd counter */
+	if (read(fd, &u, sizeof(u)) < 0)
+		return;
+
+	/* Process all available frames in the RX queue */
+	while (realemu_handle_rx_queue(ctx->realemu_device, &macevent) > 0) {
+		cookie = macevent.mpduDigest.mpducacheaddr;
+		frame = dequeue_frame_by_cookie(ctx, cookie);
+		if (!frame) {
+			w_logf(ctx, LOG_DEBUG, "RX: no pending frame for cookie=%llu\n",
+			       (unsigned long long)cookie);
+			continue;
+		}
+
+		complete_unicast_hw_success(ctx, frame);
+		rearm_timer(ctx);
+	}
+}
+
+static int init_hardware(struct realwmediumd *ctx)
+{
+	char *h2c_dev = DEVICE_H2C;
+	char *c2h_dev = DEVICE_C2H;
+	char *user_dev = DEVICE_LITE;
+	int rx_eventfd;
+
+	ctx->realemu_device = realemu_device_init(h2c_dev, c2h_dev, user_dev);
+	if (ctx->realemu_device == NULL) {
+		fprintf(stderr, "Error: Failed to initialize RealEmu hardware\n");
+		return -1;
+	}
+
+	/* Register eventfd with libevent for RX notifications */
+	rx_eventfd = realemu_get_rx_eventfd(ctx->realemu_device);
+	if (rx_eventfd < 0) {
+		fprintf(stderr, "Error: Failed to get realemu RX eventfd\n");
+		realemu_device_cleanup(ctx->realemu_device);
+		ctx->realemu_device = NULL;
+		return -1;
+	}
+
+	event_set(&ctx->rx_ev, rx_eventfd, EV_READ | EV_PERSIST,
+		  realemu_rx_event_callback, ctx);
+	event_add(&ctx->rx_ev, NULL);
+
+	w_logf(ctx, LOG_NOTICE, "RealEmu hardware initialized successfully\n");
+	return 0;
+}
+
+static void cleanup_hardware(struct realwmediumd *ctx)
+{
+	if (ctx->realemu_device != NULL) {
+		realemu_device_cleanup(ctx->realemu_device);
+		ctx->realemu_device = NULL;
+	}
+}
+
 
 int main(int argc, char *argv[])
 {
 	int opt;//命令行参数
 	struct realwmediumd ctx;  //上下文结构体，用于存储程序状态和配置
+	struct event ev_timer;
     char *config_file = NULL;  //配置文件路径
 	char *per_file = NULL;  //PER 文件路径
 
@@ -921,7 +1354,9 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "This program needs arguments....\n\n");
 		print_help(EXIT_FAILURE);
 	}
+	memset(&ctx, 0, sizeof(ctx));
 	ctx.log_lvl = 6;
+	ctx.op_mode = LOCAL;
     unsigned long int parse_log_lvl;
     char* parse_end_token;
 	bool start_server = false;
@@ -975,26 +1410,73 @@ int main(int argc, char *argv[])
 		}
     }
 
+	if (!full_dynamic && !config_file) {
+		printf("%s: config file must be supplied\n", argv[0]);
+		print_help(EXIT_FAILURE);
+	}
+
+	/* init libevent before registering any event objects */
+	event_init();
+
 	//  1.检查硬件是否正常可以打开运行，如果可以正常打开则进行到下一步，打开硬件读写线程。
-	init_hardware(&ctx);
+	if (init_hardware(&ctx) < 0) {
+		return EXIT_FAILURE;
+	}
 	//  2.检查传入参数是否符合要求，如符合则继续调用完成参数初始化配置。
 	INIT_LIST_HEAD(&ctx.stations);
 	if (load_config(&ctx, config_file, per_file, full_dynamic))
 		return EXIT_FAILURE;
-	//  3.注册hwsim事件，开启事件处理线程（计时器触发+底层触发，如底层有数据待处理则触发）；
-	/* init libevent */
-	event_init();
+
 	/* init netlink */
 	if (init_netlink(&ctx) < 0)
 		return EXIT_FAILURE;
 
+	/* Register netlink socket with libevent */
+	event_set(&ctx.ev_cmd, nl_socket_get_fd(ctx.sock), EV_READ | EV_PERSIST,
+		  sock_event_cb, &ctx);
+	event_add(&ctx.ev_cmd, NULL);
+
+	/* setup timer event used by original wmediumd scheduling path */
+	ctx.timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+	if (ctx.timerfd < 0)
+		return EXIT_FAILURE;
+	clock_gettime(CLOCK_MONOTONIC, &ctx.intf_updated);
+	clock_gettime(CLOCK_MONOTONIC, &ctx.next_move);
+	ctx.next_move.tv_sec += MOVE_INTERVAL;
+	event_set(&ev_timer, ctx.timerfd, EV_READ | EV_PERSIST, timer_cb, &ctx);
+	event_add(&ev_timer, NULL);
+
+	/* register for incoming frames from kernel */
+	if (send_register_msg(&ctx) == 0)
+		w_logf(&ctx, LOG_NOTICE, "REGISTER SENT!\n");
+
+	if (start_server)
+		start_wserver(&ctx);
+
 	//    3.1  底层触发事件的接收节点的事件的发送：send_cloned_frame_msg
 	//    3.2  计时器触发事件的发送节点的事件的发送：tx_info
 	//  4.注册wserver线程，响应mininet-wifi的请求，完成内部配置
-	
-	//
 
+	/* enter libevent main loop */
+	event_dispatch();
+
+	if (start_server)
+		stop_wserver();
+
+    // 清理硬件资源
+    cleanup_hardware(&ctx);
+
+	if (ctx.timerfd > 0)
+		close(ctx.timerfd);
+	if (ctx.sock)
+		nl_socket_free(ctx.sock);
+	if (ctx.cb)
+		nl_cb_put(ctx.cb);
+	free(ctx.intf);
+	free(ctx.per_matrix);
+	free(ctx.snr_matrix);
+	free(ctx.error_prob_matrix);
+	free(ctx.station_err_matrix);
 
     return EXIT_SUCCESS;
 }
-    

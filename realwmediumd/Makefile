@@ -50,17 +50,55 @@ CFLAGS += $(shell $(PKG_CONFIG) --cflags $(NLLIBNAME))
 CFLAGS += -DVERSION_STR=$(VERSION_STR)
 LDFLAGS += -lconfig -lpthread
 
-TARGET = realwmediumd
-OBJECTS= realwmediumd.o
+# include paths for headers
+CFLAGS += -I../include -I../realemu-hw -I../tools
 
+# 主程序目标
+TARGET = realwmediumd
+
+# realwmediumd 本身的源文件
+SOURCES = realwmediumd.c config.c per.c wserver.c realwmediumd_dynamic.c \
+	  wserver_messages.c wserver_messages_network.c
+
+# realwmediumd 本身的对象文件
+OBJECTS = $(SOURCES:.c=.o)
+
+# 其他源的库路径
+REALEMU_HW_LIB = ../realemu-hw/realemu_hw.o
+TOOLS_LIBS = ../tools/reg_rw.o ../tools/dma_with_device.o ../tools/dma_utils.o
+
+# 所有依赖项
+ALL_LIBS = $(REALEMU_HW_LIB) $(TOOLS_LIBS)
+
+# 默认目标：构建主程序
 all: $(TARGET)
 
-$(TARGET): $(OBJECTS)
-	@echo "Building $(TARGET)..."
-	$(CC) -o $@ $(OBJECTS) $(LDFLAGS)
+# 构建主程序：先编译依赖库，再编译本地源文件，最后链接
+$(TARGET): build-deps $(OBJECTS)
+	@echo "Linking $(TARGET)..."
+	$(CC) -o $@ $(OBJECTS) $(ALL_LIBS) $(LDFLAGS)
 	@echo "$(TARGET) built successfully"
 
+# 编译依赖库（调用其他 Makefile）
+.PHONY: build-deps
+build-deps:
+	@echo "Building realemu-hw dependencies..."
+	@$(MAKE) -C ../realemu-hw
+	@echo "Building tools dependencies..."
+	@$(MAKE) -C ../tools
+
+# 本地对象文件编译规则
+%.o: %.c
+	@echo "Compiling $<..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 clean:
-	@echo "Cleaning $(OBJECTS) $(TARGET)..."
+	@echo "Cleaning realwmediumd..."
 	rm -f $(OBJECTS) $(TARGET)
-	@echo "Clean completed"
+	@echo "Cleaning realwmediumd completed"
+	@echo "Cleaning dependencies..."
+	@$(MAKE) -C ../realemu-hw clean
+	@$(MAKE) -C ../tools clean
+	@echo "All clean completed"
+
+.PHONY: all clean build-deps

@@ -99,7 +99,7 @@ static void calc_signal(struct request_ctx *ctx)
  * @param ctx The wmediumd context
  * @return The FD of the socket
  */
-int create_listen_socket(struct wmediumd *ctx) {
+int create_listen_socket(struct realwmediumd *ctx) {
     int soc = socket(AF_UNIX, SOCK_STREAM, 0);
     if (soc < 0) {
         w_logf(ctx, LOG_ERR, LOG_PREFIX "Socket not created: %s\n", strerror(errno));
@@ -531,7 +531,7 @@ int handle_medium_update_request(struct request_ctx *ctx, const medium_update_re
     return ret;
 }
 
-int parse_recv_msg_rest_error(struct wmediumd *ctx, int value) {
+int parse_recv_msg_rest_error(struct realwmediumd *ctx, int value) {
     if (value > 0) {
         return value;
     } else {
@@ -636,7 +636,7 @@ int receive_handle_request(struct request_ctx *ctx) {
 }
 
 struct accept_context {
-    struct wmediumd *wctx;
+    struct realwmediumd *wctx;
     int server_socket;
     int client_socket;
     pthread_t *thread;
@@ -723,7 +723,7 @@ void *run_wserver(void *ctx) {
     return NULL;
 }
 
-int start_wserver(struct wmediumd *ctx) {
+int start_wserver(struct realwmediumd *ctx) {
     return pthread_create(&server_thread, NULL, run_wserver, ctx);
 }
 

@@ -391,7 +391,7 @@ void *forward_tx_thread_func(void *arg) {
             pthread_mutex_unlock(queue_lock);
             
             // 发送数据包
-            int ret = send_pkt_data(realemu_device, item.macevent);
+            int ret = realemu_send_pkt_data(realemu_device, item.macevent);
             if (ret == 0) {
                 int handle_ret = realemu_handle_tx_queue(realemu_device);
                 if (handle_ret > 0) {
@@ -466,7 +466,7 @@ int main() {
                 channel_cfg.dstPhyId = dst;
                 channel_cfg.distance = DEFAULT_DISTANCE;
                 
-                ret = send_topo_data(realemu_device, channel_cfg);
+                ret = realemu_send_topo_data(realemu_device, channel_cfg);
                 if (ret == 0) {
                     topo_sent_count++;
                 }

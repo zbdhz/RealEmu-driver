@@ -113,7 +113,7 @@ int init_netlink(struct realwmediumd *ctx);
 
 **与 realemu-hw 的交互**：
 - `init_hardware()` 调用 `realemu_device_init()` 初始化硬件
-- `queue_frame()` 将 frame 转换为 MacEvent 并调用 `send_pkt_data()`
+- `queue_frame()` 将 frame 转换为 MacEvent 并调用 `realemu_send_pkt_data()`
 - RX 处理线程调用 `realemu_handle_rx_queue()` 从硬件接收数据
 
 ---
@@ -219,9 +219,9 @@ struct RealEmu_Device {
 RealEmu_Device* realemu_device_init(char *h2c_dev, char *c2h_dev, char *user_dev);
 void realemu_device_cleanup(RealEmu_Device* realemu_device);
 
-int send_pkt_data(RealEmu_Device* realemu_device, MacEvent macevent);
-int send_topo_data(RealEmu_Device* realemu_device, ChannelCfg channel_cfg);
-int send_per_data(RealEmu_Device* realemu_device, PerCfg per_cfg);
+int realemu_send_pkt_data(RealEmu_Device* realemu_device, MacEvent macevent);
+int realemu_send_topo_data(RealEmu_Device* realemu_device, ChannelCfg channel_cfg);
+int realemu_send_per_data(RealEmu_Device* realemu_device, PerCfg per_cfg);
 
 int realemu_handle_rx_queue(RealEmu_Device* realemu_device, MacEvent* macevent);
 int realemu_update_rx_queue(RealEmu_Device* realemu_device);
@@ -456,7 +456,7 @@ hwsim (内核)
     ↓ deliver_expired_frames()
 frame_to_mac_event()
     ↓ 转换为 MacEvent
-send_pkt_data()
+realemu_send_pkt_data()
     ↓ 放入 TX 队列
 FPGA 硬件
 ```
@@ -474,7 +474,7 @@ realwmediumd_dynamic 函数
 sync_to_hardware()
     ↓ 调用
 realemu-hw 函数
-    ↓ send_topo_data() / send_per_data()
+    ↓ realemu_send_topo_data() / realemu_send_per_data()
     ↓ 放入 TX 队列
 FPGA 硬件
 ```
@@ -700,27 +700,53 @@ realemu-hw
 ### 10.1 构建说明
 
 ```bash
-# 构建 realemu-hw 模块
-cd realemu-hw
+# 进入 realwmediumd 目录，执行主程序构建
+cd realwmediumd
 make
 
-# 构建 realwmediumd 模块
-cd ../realwmediumd
-make
-
-# 构建所有模块
-cd ..
-make
+# 说明：realwmediumd/Makefile 会自动调用
+# ../realemu-hw/Makefile 和 ../tools/Makefile
+# 先生成依赖对象，再链接生成 realwmediumd 可执行文件
 ```
 
-### 10.2 运行时要求
+当前 Makefile 的默认行为如下：
+
+- `tools/Makefile`
+    - 默认目标 `make`：仅生成库对象文件（`reg_rw.o`、`dma_with_device.o`、`dma_utils.o`）
+    - 可选测试目标：`make dma_test`、`make cfg_test`
+
+- `realemu-hw/Makefile`
+    - 默认目标 `make`：仅生成库对象文件（`realemu_hw.o`）
+    - 可选测试目标：`make test_rtt`、`make test_throughput`
+
+- `realwmediumd/Makefile`
+    - 默认目标 `make`：自动调用上面两个目录的 Makefile 生成依赖对象
+    - 随后编译本目录源文件并链接生成 `realwmediumd`
+
+- 顶层 `Makefile`
+    - 当前仅构建 `tools` 和 `realemu-hw`
+    - 不会直接生成 `realwmediumd` 可执行文件
+
+### 10.2 清理构建产物
+
+```bash
+# 清理 realwmediumd 及其依赖目录产物
+cd realwmediumd
+make clean
+
+# 或单独清理某个模块
+cd ../tools && make clean
+cd ../realemu-hw && make clean
+```
+
+### 10.3 运行时要求
 
 - XDMA 内核驱动已加载
 - XDMA 设备文件可访问：`/dev/xdma0_h2c_0`、`/dev/xdma0_c2h_0`、`/dev/xdma0_user`
 - mac80211_hwsim 内核模块已加载
 - FPGA 硬件已编程并连接
 
-### 10.3 运行
+### 10.4 运行
 
 ```bash
 # 启动 realwmediumd

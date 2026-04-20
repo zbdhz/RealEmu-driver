@@ -26,7 +26,7 @@
 
 #include <stdint.h>
 #include <pthread.h>
-#include "wmediumd.h"
+#include "realwmediumd.h"
 
 typedef uint8_t u8;
 typedef int32_t i32;
@@ -37,7 +37,7 @@ typedef int32_t i32;
  * @param addr The MAC address of the station
  * @return The station ID or a negative errno value
  */
-int add_station(struct wmediumd *ctx, const u8 addr[]);
+int add_station(struct realwmediumd *ctx, const u8 addr[]);
 
 /**
  * Delete a station
@@ -45,7 +45,7 @@ int add_station(struct wmediumd *ctx, const u8 addr[]);
  * @param station The station to delete
  * @return 0 on success otherwise a negative errno value
  */
-int del_station(struct wmediumd *ctx, struct station *station);
+int del_station(struct realwmediumd *ctx, struct station *station);
 
 /**
  * Delete a station by its id
@@ -53,7 +53,7 @@ int del_station(struct wmediumd *ctx, struct station *station);
  * @param id The ID of the station
  * @return 0 on success otherwise a negative errno value
  */
-int del_station_by_id(struct wmediumd *ctx, const i32 id);
+int del_station_by_id(struct realwmediumd *ctx, const i32 id);
 
 /**
  * Delete a station by its address
@@ -61,7 +61,7 @@ int del_station_by_id(struct wmediumd *ctx, const i32 id);
  * @param addr The MAC address of the station
  * @return 0 on success otherwise a negative errno value
  */
-int del_station_by_mac(struct wmediumd *ctx, const u8 *addr);
+int del_station_by_mac(struct realwmediumd *ctx, const u8 *addr);
 
 /**
  * Lock for the snr matrix/station list
