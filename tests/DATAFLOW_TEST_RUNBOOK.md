@@ -55,10 +55,8 @@ sudo bash tests/dataflow_smoke.sh
 ```bash
 ip link set <dev> down
 ip link set address <mac> dev <dev>
-iw dev <dev> set type mesh
-iw dev <dev> set channel 36
+iw dev <dev> set type managed
 ip link set <dev> up
-iw dev <dev> mesh join realemu-smoke
 ip addr flush dev <dev>
 ip addr add <ip>/24 dev <dev>
 ```

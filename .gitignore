@@ -85,5 +85,6 @@ realwmediumd/*.o
 realwmediumd/realwmediumd
 
 # test目录
-test/*.o
+tests/*.o
+tests/tests*
 # test/test_*

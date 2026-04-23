@@ -47,21 +47,27 @@ int pkt_duration(struct realwmediumd *ctx, int len, int rate)
 int w_logf(struct realwmediumd *ctx, u8 level, const char *format, ...)
 {
 	va_list(args);
+	int ret = -1;
+
 	va_start(args, format);
 	if (ctx->log_lvl >= level) {
-		return vprintf(format, args);
+		ret = vprintf(format, args);
 	}
-	return -1;
+	va_end(args);
+	return ret;
 }
 
 int w_flogf(struct realwmediumd *ctx, u8 level, FILE *stream, const char *format, ...)
 {
 	va_list(args);
+	int ret = -1;
+
 	va_start(args, format);
 	if (ctx->log_lvl >= level) {
-		return vfprintf(stream, format, args);
+		ret = vfprintf(stream, format, args);
 	}
-	return -1;
+	va_end(args);
+	return ret;
 }
 
 static void wqueue_init(struct wqueue *wqueue, int cw_min, int cw_max)
@@ -406,12 +412,17 @@ static void complete_unicast_hw_success(struct realwmediumd *ctx,
 	dest = hdr->addr1;
 	dst_sta = get_station_by_addr(ctx, dest);
 
+	w_logf(ctx, LOG_NOTICE, "[COMPLETE] Frame cookie=%llu ACKed by hardware, delivering to dst=" MAC_FMT "\n",
+	       (unsigned long long)frame->cookie, MAC_ARGS(dest));
+
 	frame->flags |= HWSIM_TX_STAT_ACK;
 	rate_idx = (frame->tx_rates_count > 0) ? frame->tx_rates[0].idx : 0;
 	if (rate_idx < 0)
 		rate_idx = 0;
 
 	if (dst_sta) {
+		w_logf(ctx, LOG_NOTICE, "[COMPLETE] Sending cloned frame to dst station (idx=%d, signal=%d)\n",
+		       dst_sta->index, frame->signal);
 		send_cloned_frame_msg(ctx, dst_sta,
 				      frame->data,
 				      frame->data_len,
@@ -420,6 +431,8 @@ static void complete_unicast_hw_success(struct realwmediumd *ctx,
 				      frame->freq);
 	}
 
+	w_logf(ctx, LOG_NOTICE, "[COMPLETE] Sending TX info to src station (cookie=%llu)\n",
+	       (unsigned long long)frame->cookie);
 	send_tx_info_frame(ctx, frame);
 	free(frame);
 }
@@ -436,6 +449,10 @@ static int send_frame_to_hardware(struct realwmediumd *ctx, struct station *send
 	MacEvent macevent;
 	int src_node, dst_node;
 	int ret;
+
+	w_logf(ctx, LOG_NOTICE, "[TX] Frame to hardware: src=" MAC_FMT " dst=" MAC_FMT " cookie=%llu len=%zu\n",
+	       MAC_ARGS(frame->sender->addr), MAC_ARGS(dest),
+	       (unsigned long long)frame->cookie, frame->data_len);
 
 	/* Get source node ID from sender station */
 	src_node = get_node_id_by_station(sender);
@@ -494,8 +511,8 @@ static int send_frame_to_hardware(struct realwmediumd *ctx, struct station *send
 		return -1;
 	}
 
-	w_logf(ctx, LOG_DEBUG, "Frame sent to hardware: %d->%d, len=%zu, cookie=%llu\n",
-	       src_node, dst_node, frame->data_len, (unsigned long long)frame->cookie);
+	w_logf(ctx, LOG_NOTICE, "[TX] Frame queued to TX queue: %d->%d, cookie=%llu, mcs=%d\n",
+	       src_node, dst_node, (unsigned long long)frame->cookie, macevent.rfParam.mcs);
 
 	return 0;
 }
@@ -513,6 +530,10 @@ void queue_frame(struct realwmediumd *ctx, struct station *station,
 	struct timespec now, target;				/* now / target：时间相关变量 */
 	int ret;
 	bool is_mcast;
+
+	w_logf(ctx, LOG_NOTICE, "[QUEUE] Frame received: src=" MAC_FMT " dst=" MAC_FMT " cookie=%llu\n",
+	       MAC_ARGS(frame->sender->addr), MAC_ARGS(dest),
+	       (unsigned long long)frame->cookie);
 	struct wqueue *queue;					/* queue：帧队列 */
 	struct frame *tail;					/* tail：队列末尾帧指针 */
 	struct station *tmpsta, *deststa;			/* deststa：目标站点 */
@@ -538,6 +559,8 @@ void queue_frame(struct realwmediumd *ctx, struct station *station,
 
 	/* 单播统一走硬件判决：默认失败，超时前若收到硬件回执再转成功。 */
 	if (!is_mcast) {
+		w_logf(ctx, LOG_NOTICE, "[QUEUE] Unicast frame, sending to hardware (cookie=%llu)\n",
+		       (unsigned long long)frame->cookie);
 		ret = send_frame_to_hardware(ctx, station, frame);
 		if (ret < 0)
 			w_logf(ctx, LOG_ERR, "Failed to enqueue unicast frame to hardware, waiting timeout as failed\n");
@@ -552,9 +575,14 @@ void queue_frame(struct realwmediumd *ctx, struct station *station,
 		ac = frame_select_queue_80211(frame);
 		queue = &station->queues[ac];
 		list_add_tail(&frame->list, &queue->frames);
+		w_logf(ctx, LOG_NOTICE, "[QUEUE] Unicast frame queued (cookie=%llu), waiting for hardware ACK or timeout\n",
+		       (unsigned long long)frame->cookie);
 		rearm_timer(ctx);
 		return;
 	}
+
+	w_logf(ctx, LOG_NOTICE, "[QUEUE] Multicast/broadcast frame, using software path (cookie=%llu)\n",
+	       (unsigned long long)frame->cookie);
 
 	//算 ACK 时间 ：计算 ACK 帧的传输时间（14字节）加上 SIFS 时间
 	int ack_time_usec = pkt_duration(ctx, 14, index_to_rate(0, frame->freq)) +
@@ -828,6 +856,11 @@ void deliver_frame(struct realwmediumd *ctx, struct frame *frame)
 	struct station *station;
 	u8 *dest = hdr->addr1;
 	u8 *src = frame->sender->addr;
+	bool has_ack = (frame->flags & HWSIM_TX_STAT_ACK) != 0;
+
+	w_logf(ctx, LOG_NOTICE, "[DELIVER] Frame cookie=%llu: src=" MAC_FMT " dst=" MAC_FMT " ACK=%s\n",
+	       (unsigned long long)frame->cookie, MAC_ARGS(src), MAC_ARGS(dest),
+	       has_ack ? "YES" : "NO");
 
 	if (frame->flags & HWSIM_TX_STAT_ACK) {
 		/* rx the frame on the dest interface */
@@ -1057,6 +1090,9 @@ static int process_recvd_data(struct realwmediumd *ctx, struct nlmsghdr *nlh)
 			}
 			memcpy(sender->hwaddr, hwaddr, ETH_ALEN);
 
+			w_logf(ctx, LOG_NOTICE, "[NETLINK] RX frame from kernel: src=" MAC_FMT " dst=" MAC_FMT " cookie=%llu len=%u\n",
+			       MAC_ARGS(src), MAC_ARGS(hdr->addr1), (unsigned long long)cookie, data_len);
+
 			frame = malloc(sizeof(*frame) + data_len);
 			if (!frame)
 				goto out;
@@ -1280,23 +1316,38 @@ static void realemu_rx_event_callback(int fd, short what, void *data)
 	MacEvent macevent;
 	struct frame *frame;
 	u64 cookie;
+	int processed = 0;
 
 	/* Clear the eventfd counter */
 	if (read(fd, &u, sizeof(u)) < 0)
 		return;
 
+	w_logf(ctx, LOG_NOTICE, "[RX] Hardware eventfd triggered, processing frames...\n");
+
 	/* Process all available frames in the RX queue */
 	while (realemu_handle_rx_queue(ctx->realemu_device, &macevent) > 0) {
 		cookie = macevent.mpduDigest.mpducacheaddr;
+		processed++;
+		w_logf(ctx, LOG_NOTICE, "[RX] Got frame from hardware: cookie=%llu, src=%d, dst=%d\n",
+		       (unsigned long long)cookie, macevent.srcMacId, macevent.dstMacId);
+
 		frame = dequeue_frame_by_cookie(ctx, cookie);
 		if (!frame) {
-			w_logf(ctx, LOG_DEBUG, "RX: no pending frame for cookie=%llu\n",
+			w_logf(ctx, LOG_ERR, "[RX] ERROR: No pending frame for cookie=%llu (frame may have timed out)\n",
 			       (unsigned long long)cookie);
 			continue;
 		}
 
+		w_logf(ctx, LOG_NOTICE, "[RX] Found matching frame (cookie=%llu), completing...\n",
+		       (unsigned long long)cookie);
 		complete_unicast_hw_success(ctx, frame);
 		rearm_timer(ctx);
+	}
+
+	if (processed == 0) {
+		w_logf(ctx, LOG_NOTICE, "[RX] Eventfd triggered but no frames in RX queue\n");
+	} else {
+		w_logf(ctx, LOG_NOTICE, "[RX] Processed %d frames from hardware\n", processed);
 	}
 }
 
@@ -1449,6 +1500,14 @@ int main(int argc, char *argv[])
 	/* register for incoming frames from kernel */
 	if (send_register_msg(&ctx) == 0)
 		w_logf(&ctx, LOG_NOTICE, "REGISTER SENT!\n");
+
+	w_logf(&ctx, LOG_NOTICE,
+	       "[STARTUP] realwmediumd is running (log_level=%u, mode=%s, stations=%d)\n",
+	       ctx.log_lvl,
+	       ctx.op_mode == LOCAL ? "local" : "distributed",
+	       ctx.num_stas);
+	w_flogf(&ctx, LOG_NOTICE, stderr,
+	        "[STARTUP] event loop entering, process initialized successfully\n");
 
 	if (start_server)
 		start_wserver(&ctx);

@@ -6,16 +6,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REALWMEDIUMD_BIN="${REALWMEDIUMD_BIN:-${REPO_ROOT}/realwmediumd/realwmediumd}"
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/dataflow_smoke.log}"
+WMEDIUMD_LOG_FILE="${WMEDIUMD_LOG_FILE:-${SCRIPT_DIR}/realwmediumd_smoke.log}"
 WORK_DIR="$(mktemp -d "${SCRIPT_DIR}/dataflow_smoke.XXXXXX")"
 CFG_FILE="${WORK_DIR}/dataflow_smoke.cfg"
 
 SUBNET="10.10.10"
 NUM_PHYS=2
-MESH_ID="realemu-smoke"
+TEST_SSID="realemu-test"
+TEST_FREQ_MHZ=2412
+TEST_BSSID="02:11:22:33:44:55"
 RADIO_MACS=(
 	"02:00:00:00:00:00"
 	"02:00:00:00:01:00"
 )
+NS_NAMES=(
+	"realemu-ns0"
+	"realemu-ns1"
+)
+
+NS_PIDS=()
 
 DEVICES=()
 PHY_NAMES=()
@@ -33,26 +42,21 @@ cleanup() {
 		wait "${REALWMEDIUMD_PID}" >/dev/null 2>&1 || true
 	fi
 
-	ip rule del priority 1000 >/dev/null 2>&1 || true
-	ip rule add priority 0 table local >/dev/null 2>&1 || true
-	echo 0 > /proc/sys/net/ipv4/conf/all/arp_ignore >/dev/null 2>&1 || true
+	# kill any background namespace helper processes
+	for pid in "${NS_PIDS[@]:-}"; do
+		kill "${pid}" >/dev/null 2>&1 || true
+	done
 
-	for i in $(seq 0 $((NUM_PHYS - 1))); do
-		prio=$((i + 10))
-		prio2=$((256 + prio))
-		tbl="${prio2}"
-
-		ip rule del priority "${prio2}" >/dev/null 2>&1 || true
-		ip rule del priority "${prio}" >/dev/null 2>&1 || true
-		ip route flush table "${tbl}" >/dev/null 2>&1 || true
+	for ns in "${NS_NAMES[@]}"; do
+		ip netns del "${ns}" >/dev/null 2>&1 || true
 	done
 
 	modprobe -r mac80211_hwsim >/dev/null 2>&1 || true
 	rm -rf "${WORK_DIR}"
 
-	if [[ "${exit_code}" -ne 0 && -f "${LOG_FILE}" ]]; then
+	if [[ "${exit_code}" -ne 0 && -f "${WMEDIUMD_LOG_FILE}" ]]; then
 		echo "realwmediumd log tail:"
-		tail -n 80 "${LOG_FILE}" || true
+		tail -n 80 "${WMEDIUMD_LOG_FILE}" || true
 	fi
 }
 
@@ -80,48 +84,96 @@ ifaces :
 	count = 2;
 	ids = ["${RADIO_MACS[0]}", "${RADIO_MACS[1]}" ];
 };
+
+model :
+{
+	type = "snr";
+	links = ( );
+	default_snr = 30;
+};
 EOF
 }
 
 wait_for_hwsim_devices() {
 	PHY_NAMES=()
-	mapfile -t PHY_NAMES < <(ls -t /sys/class/ieee80211 2>/dev/null | head -n "${NUM_PHYS}")
+	mapfile -t PHY_NAMES < <(
+		for phy in /sys/class/ieee80211/*; do
+			[[ -d "${phy}" ]] || continue
+			phy_name="$(basename "${phy}")"
+			dev_path="$(readlink -f "${phy}/device" 2>/dev/null || true)"
+			if [[ "${dev_path}" == *"/mac80211_hwsim/"* || "${dev_path}" == *"/virtual/"*"mac80211_hwsim"* ]]; then
+				echo "${phy_name}"
+			fi
+		done | head -n "${NUM_PHYS}"
+	)
 	if [[ "${#PHY_NAMES[@]}" -ne "${NUM_PHYS}" ]]; then
-		echo "Expected ${NUM_PHYS} hwsim phys, found ${#PHY_NAMES[@]}" >&2
+		echo "Expected ${NUM_PHYS} mac80211_hwsim phys, found ${#PHY_NAMES[@]}" >&2
 		exit 1
 	fi
 }
 
+create_namespaces() {
+	NS_PIDS=()
+	for ns in "${NS_NAMES[@]}"; do
+		ip netns del "${ns}" >/dev/null 2>&1 || true
+		ip netns add "${ns}"
+		ip -n "${ns}" link set lo up
+		# start a sleeping helper inside namespace so we have a PID to move devices to
+		ip netns exec "${ns}" sleep 6000 &
+		NS_PIDS+=("$!")
+	done
+}
+
 configure_station() {
 	local phy_name="$1"
-	local mac_addr="$2"
-	local ip_addr="$3"
-	local prio="$4"
+	local ns_name="$2"
+	local mac_addr="$3"
+	local ip_addr="$4"
 
 	local dev_name
-	dev_name="$(ls /sys/class/ieee80211/${phy_name}/device/net)"
+	dev_name="$(ls /sys/class/ieee80211/${phy_name}/device/net | head -n1)"
+
+	echo "Configuring ${dev_name} (phy: ${phy_name}, netns: ${ns_name})..."
+
+	ip link set "${dev_name}" down || { echo "Failed to set ${dev_name} down"; exit 1; }
+	ip link set address "${mac_addr}" dev "${dev_name}" || { echo "Failed to set MAC ${mac_addr} on ${dev_name}"; exit 1; }
+	iw phy "${phy_name}" set netns name "${ns_name}" || {
+		echo "Failed to move phy ${phy_name} to ${ns_name}" >&2
+		exit 1
+	}
+
+	dev_name="$(ip netns exec "${ns_name}" ls /sys/class/ieee80211/${phy_name}/device/net | head -n1)"
 	DEVICES+=("${dev_name}")
 
-	ip link set "${dev_name}" down
-	ip link set address "${mac_addr}" dev "${dev_name}"
-	iw dev "${dev_name}" set type mesh
-	iw dev "${dev_name}" set channel 36
-	ip link set "${dev_name}" up
-	iw dev "${dev_name}" mesh join "${MESH_ID}"
+	ip -n "${ns_name}" link set "${dev_name}" down || true
+	ip netns exec "${ns_name}" iw dev "${dev_name}" set type ibss || { echo "Failed to set ${dev_name} to ibss mode (netns)"; exit 1; }
+	ip -n "${ns_name}" link set "${dev_name}" up || { echo "Failed to bring up ${dev_name} in ${ns_name}"; exit 1; }
+	ip netns exec "${ns_name}" iw dev "${dev_name}" ibss join "${TEST_SSID}" "${TEST_FREQ_MHZ}" fixed-freq "${TEST_BSSID}" || {
+		echo "Failed to join IBSS on ${dev_name} in ${ns_name}"; exit 1;
+	}
+	ip -n "${ns_name}" addr flush dev "${dev_name}"
+	ip -n "${ns_name}" addr add "${ip_addr}/24" dev "${dev_name}"
+	ip -n "${ns_name}" route replace "${SUBNET}.0/24" dev "${dev_name}"
+}
 
-	ip addr flush dev "${dev_name}"
-	ip addr add "${ip_addr}/24" dev "${dev_name}"
+assert_data_plane_activity() {
+	local tx_0_to_1
+	local tx_1_to_0
+	local hw_complete
 
-	prio2=$((256 + prio))
-	tbl="${prio2}"
+	tx_0_to_1=$(grep -c "\\[TX\\] Frame queued to TX queue: 0->1" "${WMEDIUMD_LOG_FILE}" || true)
+	tx_1_to_0=$(grep -c "\\[TX\\] Frame queued to TX queue: 1->0" "${WMEDIUMD_LOG_FILE}" || true)
+	hw_complete=$(grep -c "\\[COMPLETE\\] Frame cookie=.*ACKed by hardware" "${WMEDIUMD_LOG_FILE}" || true)
 
-	echo 1 > "/proc/sys/net/ipv4/conf/${dev_name}/accept_local"
-	ip rule del priority "${prio}" >/dev/null 2>&1 || true
-	ip rule add priority "${prio}" iif "${dev_name}" lookup local
-	ip rule del priority "${prio2}" >/dev/null 2>&1 || true
-	ip rule add priority "${prio2}" from "${ip_addr}" table "${tbl}"
-	ip route flush table "${tbl}" >/dev/null 2>&1 || true
-	ip route add default dev "${dev_name}" table "${tbl}"
+	echo "TX 0->1 count: ${tx_0_to_1}"
+	echo "TX 1->0 count: ${tx_1_to_0}"
+	echo "HW complete count: ${hw_complete}"
+
+	if [[ "${tx_0_to_1}" -eq 0 || "${tx_1_to_0}" -eq 0 || "${hw_complete}" -eq 0 ]]; then
+		echo "FAIL: data plane activity missing in realwmediumd log" >&2
+		echo "Expected at least one 0->1 TX, one 1->0 TX, and one hardware completion." >&2
+		return 1
+	fi
 }
 
 main() {
@@ -132,6 +184,7 @@ main() {
 	require_cmd ping
 	require_cmd ls
 	require_cmd tail
+	require_cmd grep
 
 	if [[ ! -x "${REALWMEDIUMD_BIN}" ]]; then
 		echo "realwmediumd binary not found: ${REALWMEDIUMD_BIN}" >&2
@@ -147,27 +200,53 @@ main() {
 
 	prepare_config
 	: > "${LOG_FILE}"
+	: > "${WMEDIUMD_LOG_FILE}"
+
+	# 验证生成的配置文件
+	echo "=== Generated config file ===" >> "${LOG_FILE}"
+	cat "${CFG_FILE}" >> "${LOG_FILE}"
+	echo "=============================" >> "${LOG_FILE}"
 
 	modprobe -r mac80211_hwsim >/dev/null 2>&1 || true
+	sleep 1
 	modprobe mac80211_hwsim radios="${NUM_PHYS}"
+	sleep 1
 
-	wait_for_hwsim_devices
-
-	configure_station "${PHY_NAMES[0]}" "${RADIO_MACS[0]}" "${SUBNET}.10" 10
-	configure_station "${PHY_NAMES[1]}" "${RADIO_MACS[1]}" "${SUBNET}.11" 11
-
-	"${REALWMEDIUMD_BIN}" -c "${CFG_FILE}" >"${LOG_FILE}" 2>&1 &
-	REALWMEDIUMD_PID=$!
-
-	if ! kill -0 "${REALWMEDIUMD_PID}" >/dev/null 2>&1; then
-		echo "realwmediumd failed to start" >&2
+	# 验证hwsim模块是否正确加载
+	if ! ls /sys/class/ieee80211 >/dev/null 2>&1; then
+		echo "Error: mac80211_hwsim module failed to load" >&2
 		exit 1
 	fi
 
-	ping -I "${SUBNET}.10" -c 5 -W 1 "${SUBNET}.11"
+	wait_for_hwsim_devices
+	create_namespaces
+
+	configure_station "${PHY_NAMES[0]}" "${NS_NAMES[0]}" "${RADIO_MACS[0]}" "${SUBNET}.10"
+	configure_station "${PHY_NAMES[1]}" "${NS_NAMES[1]}" "${RADIO_MACS[1]}" "${SUBNET}.11"
+
+	"${REALWMEDIUMD_BIN}" -l 7 -c "${CFG_FILE}" >>"${WMEDIUMD_LOG_FILE}" 2>&1 &
+	REALWMEDIUMD_PID=$!
+	sleep 2
+
+	if ! kill -0 "${REALWMEDIUMD_PID}" >/dev/null 2>&1; then
+		echo "realwmediumd failed to start" >&2
+		echo "=== realwmediumd log ===" >&2
+		cat "${WMEDIUMD_LOG_FILE}" >&2
+		exit 1
+	fi
+
+	echo "realwmediumd started with PID ${REALWMEDIUMD_PID}"
+
+	ip netns exec "${NS_NAMES[0]}" ping -c 5 -W 1 "${SUBNET}.11"
+
+	assert_data_plane_activity
+
+	echo "=== realwmediumd log tail ==="
+	tail -n 80 "${WMEDIUMD_LOG_FILE}" || true
 
 	echo "PASS: data flow smoke test completed successfully"
-	echo "Log file: ${LOG_FILE}"
+	echo "Script log file: ${LOG_FILE}"
+	echo "realwmediumd log file: ${WMEDIUMD_LOG_FILE}"
 }
 
 main "$@"
