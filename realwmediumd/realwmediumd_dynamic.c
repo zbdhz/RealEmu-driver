@@ -37,6 +37,10 @@ pthread_rwlock_t snr_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 int add_station(struct realwmediumd *ctx, const u8 addr[]) {
     struct station *sta_loop;
+
+	if (ctx->num_stas >= NODE_NUM)
+		return -ENOSPC;
+
     list_for_each_entry(sta_loop, &ctx->stations, list) {
         if (memcmp(sta_loop->addr, addr, ETH_ALEN) == 0)
             return -EEXIST;
@@ -51,9 +55,30 @@ int add_station(struct realwmediumd *ctx, const u8 addr[]) {
         int *old_snr_matrix;
         double *old_errprob_matrix;
         double **old_station_err_matrix;
-    } matrizes;
+    } matrizes = { 0 };
     int ret;
-    if (ctx->station_err_matrix != NULL) {
+
+    if (oldnum == 0) {
+        if (ctx->station_err_matrix != NULL) {
+            ctx->station_err_matrix = calloc(newnum * newnum, sizeof(double *));
+            if (!ctx->station_err_matrix) {
+                ret = -ENOMEM;
+                goto out;
+            }
+        } else if (ctx->error_prob_matrix != NULL) {
+            ctx->error_prob_matrix = calloc(newnum * newnum, sizeof(double));
+            if (!ctx->error_prob_matrix) {
+                ret = -ENOMEM;
+                goto out;
+            }
+        } else {
+            ctx->snr_matrix = calloc(newnum * newnum, sizeof(int));
+            if (!ctx->snr_matrix) {
+                ret = -ENOMEM;
+                goto out;
+            }
+        }
+    } else if (ctx->station_err_matrix != NULL) {
         swap_matrix(ctx->station_err_matrix, oldnum, newnum, double*, matrizes.old_station_err_matrix);
     } else if (ctx->error_prob_matrix != NULL) {
         swap_matrix(ctx->error_prob_matrix, oldnum, newnum, double, matrizes.old_errprob_matrix);
@@ -102,12 +127,14 @@ int add_station(struct realwmediumd *ctx, const u8 addr[]) {
         }
     }
 
-    if (ctx->station_err_matrix != NULL) {
-        free(matrizes.old_station_err_matrix);
-    } else if (ctx->error_prob_matrix != NULL) {
-        free(matrizes.old_errprob_matrix);
-    } else {
-        free(matrizes.old_snr_matrix);
+    if (oldnum > 0) {
+        if (ctx->station_err_matrix != NULL) {
+            free(matrizes.old_station_err_matrix);
+        } else if (ctx->error_prob_matrix != NULL) {
+            free(matrizes.old_errprob_matrix);
+        } else {
+            free(matrizes.old_snr_matrix);
+        }
     }
 
     // Init new station object
@@ -126,7 +153,6 @@ int add_station(struct realwmediumd *ctx, const u8 addr[]) {
     station->medium_id = MEDIUM_ID_DEFAULT;
     station_init_queues(station);
     list_add_tail(&station->list, &ctx->stations);
-    //realloc(ctx->sta_array, 1);
     ctx->sta_array[station->index] = station;
     ctx->num_stas = (int) newnum;
     ret = station->index;
@@ -142,42 +168,68 @@ int del_station(struct realwmediumd *ctx, struct station *station) {
     }
     size_t oldnum = (size_t) ctx->num_stas;
     size_t newnum = oldnum - 1;
+    size_t index;
 
     // Save old matrix and init new matrix
     union {
         int *old_snr_matrix;
         double *old_errprob_matrix;
         double **old_station_err_matrix;
-    } matrizes;
-    if (ctx->station_err_matrix != NULL) {
-        swap_matrix(ctx->station_err_matrix, oldnum, newnum, double*, matrizes.old_station_err_matrix);
-    } else if (ctx->error_prob_matrix != NULL) {
-        swap_matrix(ctx->error_prob_matrix, oldnum, newnum, double, matrizes.old_errprob_matrix);
+    } matrizes = { 0 };
+
+    index = (size_t) station->index;
+
+    if (newnum == 0) {
+        if (ctx->station_err_matrix != NULL) {
+            free(ctx->station_err_matrix);
+            ctx->station_err_matrix = NULL;
+        }
+        if (ctx->error_prob_matrix != NULL) {
+            free(ctx->error_prob_matrix);
+            ctx->error_prob_matrix = NULL;
+        }
+        if (ctx->snr_matrix != NULL) {
+            free(ctx->snr_matrix);
+            ctx->snr_matrix = NULL;
+        }
     } else {
-        swap_matrix(ctx->snr_matrix, oldnum, newnum, int, matrizes.old_snr_matrix);
+        if (ctx->station_err_matrix != NULL) {
+            swap_matrix(ctx->station_err_matrix, oldnum, newnum, double*, matrizes.old_station_err_matrix);
+        } else if (ctx->error_prob_matrix != NULL) {
+            swap_matrix(ctx->error_prob_matrix, oldnum, newnum, double, matrizes.old_errprob_matrix);
+        } else {
+            swap_matrix(ctx->snr_matrix, oldnum, newnum, int, matrizes.old_snr_matrix);
+        }
     }
 
-    size_t index = (size_t) station->index;
+    if (newnum > 0) {
+        int next_index = 0;
+        struct station *sta_loop;
 
-    // Decreasing index of stations following deleted station
-    struct station *sta_loop = station;
-    list_for_each_entry_from(sta_loop, &ctx->stations, list) {
-        sta_loop->index = sta_loop->index - 1;
+        list_for_each_entry(sta_loop, &ctx->stations, list) {
+            if (sta_loop == station)
+                continue;
+
+            sta_loop->index = next_index;
+            ctx->sta_array[next_index] = sta_loop;
+            next_index++;
+        }
+
+        for (; next_index < NODE_NUM; next_index++)
+            ctx->sta_array[next_index] = NULL;
     }
 
-    if (ctx->station_err_matrix != NULL) {
+    if (ctx->station_err_matrix != NULL && newnum > 0) {
         for (size_t x = 0; x < oldnum; x++) {
-            // free old specific matrices
             if (matrizes.old_station_err_matrix[x * oldnum + index] != NULL) {
                 free(matrizes.old_station_err_matrix[x * oldnum + index]);
             }
         }
 
         for (size_t y = 0; y < oldnum; y++) {
-            if(y == index){
+            if (y == index) {
                 continue;
             }
-            // free old specific matrices
             if (matrizes.old_station_err_matrix[index * oldnum + y] != NULL) {
                 free(matrizes.old_station_err_matrix[index * oldnum + y]);
             }
@@ -185,38 +237,45 @@ int del_station(struct realwmediumd *ctx, struct station *station) {
     }
 
     // Copy all values not related to deleted station
-    int xnew = 0;
-    for (size_t x = 0; x < oldnum; x++) {
-        if (x == index) {
-            continue;
-        }
-        int ynew = 0;
-        for (size_t y = 0; y < oldnum; y++) {
-            if (y == index) {
+    if (newnum > 0) {
+        int xnew = 0;
+        for (size_t x = 0; x < oldnum; x++) {
+            if (x == index) {
                 continue;
             }
-            if (ctx->station_err_matrix != NULL) {
-                ctx->station_err_matrix[xnew * newnum + ynew] = matrizes.old_station_err_matrix[x * oldnum + y];
-            } else if (ctx->error_prob_matrix != NULL) {
-                ctx->error_prob_matrix[xnew * newnum + ynew] = matrizes.old_errprob_matrix[x * oldnum + y];
-            } else {
-                ctx->snr_matrix[xnew * newnum + ynew] = matrizes.old_snr_matrix[x * oldnum + y];
+            int ynew = 0;
+            for (size_t y = 0; y < oldnum; y++) {
+                if (y == index) {
+                    continue;
+                }
+                if (ctx->station_err_matrix != NULL) {
+                    ctx->station_err_matrix[xnew * newnum + ynew] = matrizes.old_station_err_matrix[x * oldnum + y];
+                } else if (ctx->error_prob_matrix != NULL) {
+                    ctx->error_prob_matrix[xnew * newnum + ynew] = matrizes.old_errprob_matrix[x * oldnum + y];
+                } else {
+                    ctx->snr_matrix[xnew * newnum + ynew] = matrizes.old_snr_matrix[x * oldnum + y];
+                }
+                ynew++;
             }
-            ynew++;
+            xnew++;
         }
-        xnew++;
-    }
 
-    if (ctx->station_err_matrix != NULL) {
-        free(matrizes.old_station_err_matrix);
-    } else if (ctx->error_prob_matrix != NULL) {
-        free(matrizes.old_errprob_matrix);
-    } else {
-        free(matrizes.old_snr_matrix);
+        if (ctx->station_err_matrix != NULL) {
+            free(matrizes.old_station_err_matrix);
+        } else if (ctx->error_prob_matrix != NULL) {
+            free(matrizes.old_errprob_matrix);
+        } else {
+            free(matrizes.old_snr_matrix);
+        }
     }
 
     list_del(&station->list);
     ctx->num_stas = (int) newnum;
+
+    if (newnum == 0) {
+        for (size_t i = 0; i < NODE_NUM; i++)
+            ctx->sta_array[i] = NULL;
+    }
 
     free(station);
     return 0;
@@ -224,7 +283,7 @@ int del_station(struct realwmediumd *ctx, struct station *station) {
 
 int del_station_by_id(struct realwmediumd *ctx, const i32 id) {
     pthread_rwlock_wrlock(&snr_lock);
-    int ret;
+    int ret = -ENODEV;
     struct station *station;
     list_for_each_entry(station, &ctx->stations, list) {
         if (station->index == id) {
@@ -234,14 +293,13 @@ int del_station_by_id(struct realwmediumd *ctx, const i32 id) {
     }
 
     out:
-    ret = -ENODEV;
     pthread_rwlock_unlock(&snr_lock);
     return ret;
 }
 
 int del_station_by_mac(struct realwmediumd *ctx, const u8 *addr) {
     pthread_rwlock_wrlock(&snr_lock);
-    int ret;
+    int ret = -ENODEV;
     struct station *station;
     list_for_each_entry(station, &ctx->stations, list) {
         if (memcmp(addr, station->addr, ETH_ALEN) == 0) {
@@ -249,7 +307,6 @@ int del_station_by_mac(struct realwmediumd *ctx, const u8 *addr) {
             goto out;
         }
     }
-    ret = -ENODEV;
 
     out:
     pthread_rwlock_unlock(&snr_lock);

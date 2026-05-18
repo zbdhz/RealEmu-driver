@@ -275,6 +275,8 @@ double get_error_prob_from_snr(double snr, unsigned int rate_idx, u32 freq,
 			       int frame_len);
 int set_default_per(struct realwmediumd *ctx);
 int read_per_file(struct realwmediumd *ctx, const char *file_name);
+int sync_topology_to_hardware(struct realwmediumd *ctx);
+int sync_per_to_hardware(struct realwmediumd *ctx);
 void timespec_add_usec(struct timespec *ts, int usec);
 bool timespec_before(struct timespec *t1, struct timespec *t2);
 int w_logf(struct realwmediumd *ctx, u8 level, const char *format, ...);

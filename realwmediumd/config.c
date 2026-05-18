@@ -585,18 +585,24 @@ int load_config(struct realwmediumd *ctx, const char *file, const char *per_file
 	bool *link_map = NULL;
 
 	if (full_dynamic) {
-		ctx->sta_array = malloc(0);
+		ctx->sta_array = calloc(NODE_NUM, sizeof(struct station *));
+		if (!ctx->sta_array) {
+			w_flogf(ctx, LOG_ERR, stderr, "Out of memory(sta_array)\n");
+			return -ENOMEM;
+		}
 		ctx->num_stas = 0;
 		ctx->intf = NULL;
 		ctx->get_fading_signal = get_no_fading_signal;
 		ctx->fading_coefficient = 0;
 		ctx->move_stations = move_stations_donothing;
-		ctx->snr_matrix = malloc(0);
+		ctx->snr_matrix = NULL;
 		ctx->per_matrix = NULL;
 		ctx->per_matrix_row_num = 0;
+		ctx->per_matrix_signal_min = 0;
 		ctx->error_prob_matrix = NULL;
 		ctx->get_link_snr = get_link_snr_default;
-		ctx->station_err_matrix = malloc(0);
+		ctx->station_err_matrix = NULL;
+		ctx->enable_medium_detection = ENABLE_MEDIUM_DETECTION;
 		return 0;
 	}
 	ctx->station_err_matrix = NULL;
@@ -621,6 +627,13 @@ int load_config(struct realwmediumd *ctx, const char *file, const char *per_file
 		return -EIO;
 	}
 	count_ids = config_setting_length(ids);
+	if (count_ids > NODE_NUM) {
+		w_flogf(ctx, LOG_ERR, stderr,
+			"Topology has %d nodes but hardware limit is %d\n",
+			count_ids, NODE_NUM);
+		config_destroy(cf);
+		return -EINVAL;
+	}
 
 	w_logf(ctx, LOG_NOTICE, "#_if = %d\n", count_ids);
 
@@ -742,7 +755,7 @@ int load_config(struct realwmediumd *ctx, const char *file, const char *per_file
     }
     medium_detection = config_lookup(cf, "ifaces.enable_medium_detection");
     if (medium_detection) {
-        ctx->enable_medium_detection =config_setting_get_bool(enable_interference);
+		ctx->enable_medium_detection = config_setting_get_bool(medium_detection);
     }else{
         ctx->enable_medium_detection = ENABLE_MEDIUM_DETECTION;
     }

@@ -16,6 +16,7 @@
 
 #include "ieee80211.h"
 #include "realwmediumd.h"
+#include "realwmediumd_dynamic.h"
 #include "config.h"
 #include "wserver.h"
 #include "../realemu-hw/realemu_hw.h"
@@ -27,11 +28,236 @@ char in_buf[PAGE_SIZE];
 static bool is_ap = true;
 
 #define HW_UNICAST_TIMEOUT_USEC 100000
+#define HW_TOPO_DEFAULT_DISTANCE 1023
+#define HW_SYNC_FLUSH_BATCH 32
 
 static int send_tx_info_frame(struct realwmediumd *ctx, struct frame *frame);
 int send_cloned_frame_msg(struct realwmediumd *ctx, struct station *dst,
 			  u8 *data, int data_len, int rate_idx, int signal,
 			  int freq);
+
+static int send_topology_entry_to_hw(struct realwmediumd *ctx,
+				     const ChannelCfg *cfg)
+{
+	int ret;
+
+	if (!ctx || !ctx->realemu_device)
+		return 0;
+
+	ret = realemu_send_topo_data(ctx->realemu_device, *cfg);
+	if (ret == 0)
+		return 0;
+
+	(void)realemu_handle_tx_queue(ctx->realemu_device);
+	ret = realemu_send_topo_data(ctx->realemu_device, *cfg);
+	return ret;
+}
+
+static int send_per_entry_to_hw(struct realwmediumd *ctx, const PerCfg *cfg)
+{
+	int ret;
+
+	if (!ctx || !ctx->realemu_device)
+		return 0;
+
+	ret = realemu_send_per_data(ctx->realemu_device, *cfg);
+	if (ret == 0)
+		return 0;
+
+	(void)realemu_handle_tx_queue(ctx->realemu_device);
+	ret = realemu_send_per_data(ctx->realemu_device, *cfg);
+	return ret;
+}
+
+static uint16_t hw_prob_to_fixed(double prob, unsigned int bits)
+{
+	double scale;
+	long value;
+	uint16_t max_value;
+
+	if (bits == 0)
+		return 0;
+
+	if (bits >= 16)
+		max_value = UINT16_MAX;
+	else
+		max_value = (uint16_t)((1u << bits) - 1u);
+
+	if (prob <= 0.0)
+		return 0;
+	if (prob >= 1.0)
+		return max_value;
+
+	scale = (double)max_value;
+	value = lround(prob * scale);
+	if (value < 0)
+		value = 0;
+	if (value > max_value)
+		value = max_value;
+	return (uint16_t)value;
+}
+
+static uint16_t hw_distance_for_pair(struct realwmediumd *ctx,
+				     int src_idx, int dst_idx)
+{
+	double dx, dy, dz, distance;
+	struct station *src;
+	struct station *dst;
+
+	if (!ctx || src_idx < 0 || dst_idx < 0 ||
+	    src_idx >= ctx->num_stas || dst_idx >= ctx->num_stas)
+		return HW_TOPO_DEFAULT_DISTANCE;
+
+	src = ctx->sta_array[src_idx];
+	dst = ctx->sta_array[dst_idx];
+	if (!src || !dst)
+		return HW_TOPO_DEFAULT_DISTANCE;
+
+	if (src_idx == dst_idx)
+		return 0;
+
+	dx = src->x - dst->x;
+	dy = src->y - dst->y;
+	dz = src->z - dst->z;
+	distance = sqrt(dx * dx + dy * dy + dz * dz);
+	if (distance < 0.0)
+		return HW_TOPO_DEFAULT_DISTANCE;
+	if (distance > HW_TOPO_DEFAULT_DISTANCE)
+		return HW_TOPO_DEFAULT_DISTANCE;
+	return (uint16_t)lround(distance);
+}
+
+static int maybe_flush_hw_tx(struct realwmediumd *ctx, int sent_since_flush)
+{
+	if (!ctx || !ctx->realemu_device)
+		return 0;
+
+	if (sent_since_flush < HW_SYNC_FLUSH_BATCH)
+		return 0;
+
+	return realemu_handle_tx_queue(ctx->realemu_device);
+}
+
+int sync_topology_to_hardware(struct realwmediumd *ctx)
+{
+	int src_id, dst_id, sent_since_flush = 0;
+	int ret = 0;
+	bool locked = false;
+
+	if (!ctx || !ctx->realemu_device)
+		return 0;
+
+	pthread_rwlock_rdlock(&snr_lock);
+	locked = true;
+
+	for (src_id = 0; src_id < NODE_NUM; src_id++) {
+		for (dst_id = 0; dst_id < NODE_NUM; dst_id++) {
+			ChannelCfg channel_cfg = { 0 };
+
+			channel_cfg.srcPhyId = (uint16_t)src_id;
+			channel_cfg.dstPhyId = (uint16_t)dst_id;
+			channel_cfg.distance = hw_distance_for_pair(ctx, src_id, dst_id);
+
+			ret = send_topology_entry_to_hw(ctx, &channel_cfg);
+			if (ret < 0) {
+				w_logf(ctx, LOG_ERR,
+				       "Failed to sync topology entry src=%d dst=%d distance=%u\n",
+				       src_id, dst_id, channel_cfg.distance);
+				goto out;
+			}
+
+			sent_since_flush++;
+			if (maybe_flush_hw_tx(ctx, sent_since_flush) < 0) {
+				w_logf(ctx, LOG_ERR,
+				       "Failed to flush hardware TX queue while syncing topology\n");
+				ret = -EIO;
+				goto out;
+			}
+			if (sent_since_flush >= HW_SYNC_FLUSH_BATCH) {
+				sent_since_flush = 0;
+			}
+		}
+	}
+
+	if (realemu_handle_tx_queue(ctx->realemu_device) < 0)
+		ret = -EIO;
+
+out:
+	if (locked)
+		pthread_rwlock_unlock(&snr_lock);
+	return ret;
+}
+
+int sync_per_to_hardware(struct realwmediumd *ctx)
+{
+	int src_id, dst_id, sent_since_flush = 0;
+	int ret = 0;
+	bool locked = false;
+
+	if (!ctx || !ctx->realemu_device)
+		return 0;
+
+	if (!ctx->error_prob_matrix && !ctx->station_err_matrix && !ctx->per_matrix)
+		return 0;
+
+	pthread_rwlock_rdlock(&snr_lock);
+	locked = true;
+
+	for (src_id = 0; src_id < NODE_NUM; src_id++) {
+		for (dst_id = 0; dst_id < NODE_NUM; dst_id++) {
+			PerCfg per_cfg = { 0 };
+			double prob = 1.0;
+
+			if (src_id < ctx->num_stas && dst_id < ctx->num_stas &&
+			    ctx->sta_array[src_id] && ctx->sta_array[dst_id]) {
+				if (ctx->station_err_matrix != NULL) {
+					double *specific = ctx->station_err_matrix[src_id * ctx->num_stas + dst_id];
+					if (specific != NULL)
+						prob = specific[0];
+				} else if (ctx->error_prob_matrix != NULL) {
+					prob = ctx->error_prob_matrix[src_id * ctx->num_stas + dst_id];
+				} else if (ctx->per_matrix != NULL) {
+					int snr = 0;
+
+					if (ctx->snr_matrix != NULL)
+						snr = ctx->snr_matrix[src_id * ctx->num_stas + dst_id];
+					prob = ctx->get_error_prob(ctx, snr, 0, 2412, 0,
+								   ctx->sta_array[src_id],
+								   ctx->sta_array[dst_id]);
+				}
+			}
+
+			per_cfg.perOut = hw_prob_to_fixed(prob, 16);
+			per_cfg.perIn = hw_prob_to_fixed(prob, 14);
+
+			ret = send_per_entry_to_hw(ctx, &per_cfg);
+			if (ret < 0) {
+				w_logf(ctx, LOG_ERR,
+				       "Failed to sync PER entry src=%d dst=%d prob=%f\n",
+				       src_id, dst_id, prob);
+				goto out;
+			}
+
+			sent_since_flush++;
+			if (maybe_flush_hw_tx(ctx, sent_since_flush) < 0) {
+				w_logf(ctx, LOG_ERR,
+				       "Failed to flush hardware TX queue while syncing PER\n");
+				ret = -EIO;
+				goto out;
+			}
+			if (sent_since_flush >= HW_SYNC_FLUSH_BATCH)
+				sent_since_flush = 0;
+		}
+	}
+
+	if (realemu_handle_tx_queue(ctx->realemu_device) < 0)
+		ret = -EIO;
+
+out:
+	if (locked)
+		pthread_rwlock_unlock(&snr_lock);
+	return ret;
+}
 
 static inline int div_round(int a, int b)
 {
@@ -1477,6 +1703,11 @@ int main(int argc, char *argv[])
 	INIT_LIST_HEAD(&ctx.stations);
 	if (load_config(&ctx, config_file, per_file, full_dynamic))
 		return EXIT_FAILURE;
+
+	if (sync_topology_to_hardware(&ctx) < 0) {
+		w_logf(&ctx, LOG_ERR, "Failed to sync initial topology to hardware\n");
+		return EXIT_FAILURE;
+	}
 
 	/* init netlink */
 	if (init_netlink(&ctx) < 0)

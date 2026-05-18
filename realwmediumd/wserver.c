@@ -94,6 +94,13 @@ static void calc_signal(struct request_ctx *ctx)
 	}
 }
 
+static void sync_topology_after_update(struct request_ctx *ctx)
+{
+    if (sync_topology_to_hardware(ctx->ctx) < 0) {
+        w_logf(ctx->ctx, LOG_ERR, LOG_PREFIX "Failed to sync topology to hardware\n");
+    }
+}
+
 /**
  * Create the listening socket
  * @param ctx The wmediumd context
@@ -219,6 +226,7 @@ int handle_position_update_request(struct request_ctx *ctx, const position_updat
 		response.update_result = WUPDATE_SUCCESS;
 
         pthread_rwlock_unlock(&snr_lock);
+        sync_topology_after_update(ctx);
     } else {
         response.update_result = WUPDATE_WRONG_MODE;
     }
@@ -443,6 +451,8 @@ int handle_delete_by_id_request(struct request_ctx *ctx, station_del_by_id_reque
                 "Station with ID %d successfully deleted\n", request->id);
         response.update_result = WUPDATE_SUCCESS;
     }
+    if (response.update_result == WUPDATE_SUCCESS)
+        sync_topology_after_update(ctx);
     ret = wserver_send_msg(ctx->sock_fd, &response, station_del_by_id_response);
     if (ret < 0) {
         w_logf(ctx->ctx, LOG_ERR, "Error on delete by id response: %s\n", strerror(abs(ret)));
@@ -469,6 +479,8 @@ int handle_delete_by_mac_request(struct request_ctx *ctx, station_del_by_mac_req
                 "Station with MAC " MAC_FMT " successfully deleted\n", MAC_ARGS(request->addr));
         response.update_result = WUPDATE_SUCCESS;
     }
+    if (response.update_result == WUPDATE_SUCCESS)
+        sync_topology_after_update(ctx);
     ret = wserver_send_msg(ctx->sock_fd, &response, station_del_by_mac_response);
     if (ret < 0) {
         w_logf(ctx->ctx, LOG_ERR, "Error on delete by mac response: %s\n", strerror(abs(ret)));
@@ -497,6 +509,8 @@ int handle_add_request(struct request_ctx *ctx, station_add_request *request) {
         response.created_id = ret;
         response.update_result = WUPDATE_SUCCESS;
     }
+    if (response.update_result == WUPDATE_SUCCESS)
+        sync_topology_after_update(ctx);
     ret = wserver_send_msg(ctx->sock_fd, &response, station_add_response);
     if (ret < 0) {
         w_logf(ctx->ctx, LOG_ERR, "Error on add response: %s\n", strerror(abs(ret)));
@@ -700,7 +714,6 @@ void on_listen_event(int fd, short what, void *wctx) {
  */
 void *run_wserver(void *ctx) {
     struct event *accept_event;
-
     old_sig_handler = signal(SIGINT, handle_sigint);
 
     listen_soc = create_listen_socket(ctx);
