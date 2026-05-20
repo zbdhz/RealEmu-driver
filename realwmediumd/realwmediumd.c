@@ -1622,6 +1622,7 @@ int main(int argc, char *argv[])
 	struct realwmediumd ctx;  //上下文结构体，用于存储程序状态和配置
 	struct event ev_timer;
     char *config_file = NULL;  //配置文件路径
+	char *log_output = NULL; /* optional log output file path */
 	char *per_file = NULL;  //PER 文件路径
 
 	//通过设置标准输出为行缓冲模式
@@ -1639,7 +1640,7 @@ int main(int argc, char *argv[])
 	bool start_server = false;
 	bool full_dynamic = false;
 
-	while ((opt = getopt(argc, argv, "hVc:l:x:sda:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVc:l:x:sda:o:")) != -1) {
 		switch (opt) {
 		case 'h':
 			print_help(EXIT_SUCCESS);
@@ -1673,6 +1674,10 @@ int main(int argc, char *argv[])
 			}
 			ctx.log_lvl = parse_log_lvl;
 			break;
+		case 'o':
+			/* redirect stdout/stderr to specified log file */
+			log_output = optarg;
+			break;
 		case 'd':
 			full_dynamic = true;
 			break;
@@ -1695,9 +1700,35 @@ int main(int argc, char *argv[])
 	/* init libevent before registering any event objects */
 	event_init();
 
+	/* if user requested a log file, open it and redirect stdout/stderr */
+	if (log_output) {
+		FILE *f = fopen(log_output, "w");
+		if (f) {
+			fflush(stdout);
+			fflush(stderr);
+			dup2(fileno(f), STDOUT_FILENO);
+			dup2(fileno(f), STDERR_FILENO);
+			/* keep line buffering on new stdout */
+			setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
+			w_flogf(NULL, LOG_NOTICE, stderr, "[STARTUP] realwmediumd: logging to %s\n", log_output);
+		} else {
+			fprintf(stderr, "Warning: could not open log file %s, continuing with stdout\n", log_output);
+		}
+	}
+
 	//  1.检查硬件是否正常可以打开运行，如果可以正常打开则进行到下一步，打开硬件读写线程。
 	if (init_hardware(&ctx) < 0) {
 		return EXIT_FAILURE;
+	}
+
+	/* Emit a short, parseable startup status so external tools can detect
+	 * whether realwmediumd has access to hardware or fell back to software. */
+	if (ctx.realemu_device != NULL) {
+		w_logf(&ctx, LOG_NOTICE, "REALW: HARDWARE_READY\n");
+		fprintf(stdout, "REALW: HARDWARE_READY\n");
+	} else {
+		w_logf(&ctx, LOG_WARNING, "REALW: SOFTWARE_FALLBACK\n");
+		fprintf(stdout, "REALW: SOFTWARE_FALLBACK\n");
 	}
 	//  2.检查传入参数是否符合要求，如符合则继续调用完成参数初始化配置。
 	INIT_LIST_HEAD(&ctx.stations);
