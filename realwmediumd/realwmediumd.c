@@ -29,6 +29,7 @@ static bool is_ap = true;
 
 #define HW_UNICAST_TIMEOUT_USEC 100000
 #define HW_TOPO_DEFAULT_DISTANCE 1023
+#define HW_TOPO_REACHABLE_DISTANCE 8
 #define HW_SYNC_FLUSH_BATCH 32
 
 static int send_tx_info_frame(struct realwmediumd *ctx, struct frame *frame);
@@ -100,31 +101,45 @@ static uint16_t hw_prob_to_fixed(double prob, unsigned int bits)
 static uint16_t hw_distance_for_pair(struct realwmediumd *ctx,
 				     int src_idx, int dst_idx)
 {
-	double dx, dy, dz, distance;
 	struct station *src;
 	struct station *dst;
+	int snr;
 
 	if (!ctx || src_idx < 0 || dst_idx < 0 ||
 	    src_idx >= ctx->num_stas || dst_idx >= ctx->num_stas)
 		return HW_TOPO_DEFAULT_DISTANCE;
+
+	if (src_idx == dst_idx)
+		return 0;
 
 	src = ctx->sta_array[src_idx];
 	dst = ctx->sta_array[dst_idx];
 	if (!src || !dst)
 		return HW_TOPO_DEFAULT_DISTANCE;
 
-	if (src_idx == dst_idx)
-		return 0;
+	/* snr 模型：按链路 SNR 判定可达性（支持星型等违反三角不等式的拓扑）。
+	 * SNR > 0 => 可达，映射为短距离；SNR <= 0 => 链路永久丢包，映射为最大距离。
+	 */
+	if (ctx->snr_matrix) {
+		snr = ctx->snr_matrix[ctx->num_stas * src_idx + dst_idx];
+		return snr > 0 ? HW_TOPO_REACHABLE_DISTANCE
+			       : HW_TOPO_DEFAULT_DISTANCE;
+	}
 
-	dx = src->x - dst->x;
-	dy = src->y - dst->y;
-	dz = src->z - dst->z;
-	distance = sqrt(dx * dx + dy * dy + dz * dz);
-	if (distance < 0.0)
-		return HW_TOPO_DEFAULT_DISTANCE;
-	if (distance > HW_TOPO_DEFAULT_DISTANCE)
-		return HW_TOPO_DEFAULT_DISTANCE;
-	return (uint16_t)lround(distance);
+	/* path_loss 模型：保留原欧氏距离行为 */
+	{
+		double dx, dy, dz, distance;
+
+		dx = src->x - dst->x;
+		dy = src->y - dst->y;
+		dz = src->z - dst->z;
+		distance = sqrt(dx * dx + dy * dy + dz * dz);
+		if (distance < 0.0)
+			return HW_TOPO_DEFAULT_DISTANCE;
+		if (distance > HW_TOPO_DEFAULT_DISTANCE)
+			return HW_TOPO_DEFAULT_DISTANCE;
+		return (uint16_t)lround(distance);
+	}
 }
 
 static int maybe_flush_hw_tx(struct realwmediumd *ctx, int sent_since_flush)
@@ -601,13 +616,19 @@ static bool is_station_valid_for_hw(struct realwmediumd *ctx, const struct stati
 	return sta && sta->index >= 0 && sta->index < NODE_NUM;
 }
 
-/* Find and detach a queued frame by cookie from all station AC queues. */
-static struct frame *dequeue_frame_by_cookie(struct realwmediumd *ctx, u64 cookie)
+/* Find and detach a queued frame by cookie from all station AC queues.
+ * cookie is a per-radio counter in mac80211_hwsim, so cookies from
+ * different senders can collide. Also match the sender node id reported
+ * by the hardware to pick the right frame. */
+static struct frame *dequeue_frame_by_cookie(struct realwmediumd *ctx, u64 cookie,
+					      int src_node)
 {
 	struct station *station;
 	int i;
 
 	list_for_each_entry(station, &ctx->stations, list) {
+		if (src_node >= 0 && station->index != src_node)
+			continue;
 		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
 			struct frame *frame;
 			list_for_each_entry(frame, &station->queues[i].frames, list) {
@@ -622,7 +643,13 @@ static struct frame *dequeue_frame_by_cookie(struct realwmediumd *ctx, u64 cooki
 	return NULL;
 }
 
-/* Complete one unicast frame using hardware ACK semantics. */
+/* Complete one unicast frame using hardware ACK semantics.
+ * The TX_INFO rates array we hold is the *planned* multi-rate retry chain
+ * from mac80211 (rates[0] = primary rate + planned retries, rates[1..] =
+ * fallback rates). If we return it untouched, minstrel credits the success
+ * to the last fallback rate and counts all planned retries as attempts,
+ * which poisons the rate statistics. Trim it like the software path does:
+ * hardware ACKed means rates[0] succeeded on its 1st attempt. */
 static void complete_unicast_hw_success(struct realwmediumd *ctx,
 					      struct frame *frame)
 {
@@ -630,6 +657,7 @@ static void complete_unicast_hw_success(struct realwmediumd *ctx,
 	struct station *dst_sta;
 	u8 *dest;
 	int rate_idx;
+	int i;
 
 	if (!frame)
 		return;
@@ -645,6 +673,15 @@ static void complete_unicast_hw_success(struct realwmediumd *ctx,
 	rate_idx = (frame->tx_rates_count > 0) ? frame->tx_rates[0].idx : 0;
 	if (rate_idx < 0)
 		rate_idx = 0;
+
+	/* Trim the MRR chain: primary rate succeeded on the first try. */
+	if (frame->tx_rates_count > 0 && frame->tx_rates[0].idx >= 0) {
+		frame->tx_rates[0].count = 1;
+		for (i = 1; i < frame->tx_rates_count; i++) {
+			frame->tx_rates[i].idx = -1;
+			frame->tx_rates[i].count = -1;
+		}
+	}
 
 	if (dst_sta) {
 		w_logf(ctx, LOG_NOTICE, "[COMPLETE] Sending cloned frame to dst station (idx=%d, signal=%d)\n",
@@ -667,6 +704,33 @@ static void complete_unicast_hw_success(struct realwmediumd *ctx,
  * Send a frame to the RealEmu hardware
  * Converts hwsim frame to MacEvent and queues it for transmission
  */
+
+/* FPGA 硬件 RTS 阈值 (-R <thresh>): 启动时 (完全空闲, 任何数据帧之前)
+ * 写一次 RTS_THRESH, 数据路径中不再改寄存器 -- 已知在发包过程中并发写
+ * THRESH 会挂死 FPGA (C2H 静默, 2026-10-10 两次复现).
+ * 帧长 > thresh 时硬件自动做 RTS/CTS (FPGA MAC 自己判断, 与真实网卡一致).
+ * 推荐固定 1400: off 阶段 1100B 不触发, on 阶段 1600B 自然触发,
+ * 全程零寄存器切换. 默认 2347 (等效关闭). */
+static int fpga_rts_thresh = 2347;
+
+static void set_fpga_rts(struct realwmediumd *ctx, int thresh)
+{
+	int node;
+
+	for (node = 0; node < NODE_NUM; node++) {
+		if (realemu_write_reg(ctx->realemu_device, node,
+				      "RTS_THRESH", thresh) < 0) {
+			w_logf(ctx, LOG_WARNING,
+			       "[RTS] Failed to set FPGA RTS_THRESH=%d on node %d\n",
+			       thresh, node);
+			return;
+		}
+	}
+	w_logf(ctx, LOG_NOTICE,
+	       "[RTS] FPGA hardware RTS_THRESH=%d on all %d nodes (fixed, set at startup idle)\n",
+	       thresh, NODE_NUM);
+}
+
 static int send_frame_to_hardware(struct realwmediumd *ctx, struct station *sender,
 				  struct frame *frame)
 {
@@ -713,22 +777,35 @@ static int send_frame_to_hardware(struct realwmediumd *ctx, struct station *send
 	/* Fill mpduDigest */
 	macevent.mpduDigest.mpducacheaddr = frame->cookie;  /* Use cookie as cache identifier */
 	macevent.mpduDigest.mpdulen = frame->data_len;
-	macevent.mpduDigest.duration = frame->duration;
  
 	/* Extract frame type and subtype from frame_control */
 	macevent.mpduDigest.frametype = (hdr->frame_control[0] & FCTL_FTYPE) >> 2;
 	macevent.mpduDigest.framesubtype = (hdr->frame_control[0] & 0xf0) >> 4;
 
 	/* Fill RF parameters from frame
-	 * 5GHz OFDM: rate idx 0-7 maps to MCS 0-7
-	 * idx: 0=6M, 1=9M, 2=12M, 3=18M, 4=24M, 5=36M, 6=48M, 7=54M
+	 * rate idx 与频段相关(per.c rateset):
+	 *   5GHz: idx 0-7 直接对应 OFDM MCS 0-7 (6/9/12/18/24/36/48/54M)
+	 *   2.4GHz: idx 0-3 是 DSSS 1/2/5.5/11M(FPGA 仅支持 OFDM, 兜底 mcs=0);
+	 *           idx 4-11 是 OFDM 6-54M -> MCS 0-7
 	 */
-	if (frame->tx_rates_count > 0 && frame->tx_rates[0].idx >= 0) {
-		macevent.rfParam.mcs = frame->tx_rates[0].idx & 0x07;  /* 5GHz OFDM: idx 0-7 -> MCS 0-7 */
+	int rate_idx = 0;
+
+	if (frame->tx_rates_count > 0 && frame->tx_rates[0].idx >= 0)
+		rate_idx = frame->tx_rates[0].idx;
+
+	if (frame->freq > 5000) {
+		macevent.rfParam.mcs = rate_idx & 0x07;
 	} else {
-		macevent.rfParam.mcs = 0;  /* Default to 6 Mbps (idx 0) */
+		macevent.rfParam.mcs = (rate_idx >= 4) ? ((rate_idx - 4) & 0x07) : 0;
 	}
 	macevent.rfParam.power = 2000;  /* Default power (arbitrary value for now) */
+
+	/* 信道占用时间: 按实际速率的 OFDM 标准公式计算, FPGA 用它推进信道时间/NAV.
+	 * 注意不能等到 queue_frame 里再赋值, 那里的 100ms 是软件重传超时, 不是发送时长.
+	 * RTS/CTS 模式由 -R 启动参数决定 (init 时已写 THRESH), 数据路径不改寄存器. */
+	macevent.mpduDigest.duration =
+		pkt_duration(ctx, frame->data_len,
+			     index_to_rate(rate_idx, frame->freq));
 
 	/* Send to hardware */
 	ret = realemu_send_pkt_data(ctx->realemu_device, macevent);
@@ -737,8 +814,9 @@ static int send_frame_to_hardware(struct realwmediumd *ctx, struct station *send
 		return -1;
 	}
 
-	w_logf(ctx, LOG_NOTICE, "[TX] Frame queued to TX queue: %d->%d, cookie=%llu, mcs=%d\n",
-	       src_node, dst_node, (unsigned long long)frame->cookie, macevent.rfParam.mcs);
+	w_logf(ctx, LOG_NOTICE, "[TX] Frame queued to TX queue: %d->%d, cookie=%llu, mcs=%d, rate_idx=%d, dur=%u\n",
+	       src_node, dst_node, (unsigned long long)frame->cookie, macevent.rfParam.mcs,
+	       rate_idx, macevent.mpduDigest.duration);
 
 	return 0;
 }
@@ -1272,6 +1350,7 @@ static int process_recvd_data(struct realwmediumd *ctx, struct nlmsghdr *nlh)
 	struct nlattr *attrs[HWSIM_ATTR_MAX+1];  //存储 netlink 属性的数组
 	/* generic netlink header*/
 	struct genlmsghdr *gnlh = nlmsg_data(nlh);  //获取 netlink 消息的数据部分，即 genlmsghdr 结构体的指针
+	int i;
 
 	struct station *sender; //发送帧的站点
 	struct frame *frame; //无线帧结构
@@ -1295,6 +1374,17 @@ static int process_recvd_data(struct realwmediumd *ctx, struct nlmsghdr *nlh)
 			struct hwsim_tx_rate *tx_rates =
 				(struct hwsim_tx_rate *)
 				nla_data(attrs[HWSIM_ATTR_TX_INFO]);
+			struct hwsim_tx_rate_flag *tx_rate_flags = NULL;
+			unsigned int tx_rate_flags_len = 0;
+
+			/* v5.15+ 内核附带 TX_INFO_FLAGS: 每速率的 RC 标志
+			 * (RTS/CTS, CTS-protect, short-preamble, MCS...) */
+			if (attrs[HWSIM_ATTR_TX_INFO_FLAGS]) {
+				tx_rate_flags = (struct hwsim_tx_rate_flag *)
+					nla_data(attrs[HWSIM_ATTR_TX_INFO_FLAGS]);
+				tx_rate_flags_len =
+					nla_len(attrs[HWSIM_ATTR_TX_INFO_FLAGS]);
+			}
 			u64 cookie = nla_get_u64(attrs[HWSIM_ATTR_COOKIE]);
 			u32 freq;
 			freq = attrs[HWSIM_ATTR_FREQ] ?
@@ -1334,6 +1424,14 @@ static int process_recvd_data(struct realwmediumd *ctx, struct nlmsghdr *nlh)
 				tx_rates_len / sizeof(struct hwsim_tx_rate);
 			memcpy(frame->tx_rates, tx_rates,
 			       min(tx_rates_len, sizeof(frame->tx_rates)));
+
+			if (tx_rate_flags) {
+				int n = tx_rate_flags_len / sizeof(struct hwsim_tx_rate_flag);
+				if (n > IEEE80211_TX_MAX_RATES)
+					n = IEEE80211_TX_MAX_RATES;
+				for (i = 0; i < n; i++)
+					frame->tx_rate_flags[i] = tx_rate_flags[i].flags;
+			}
 			
 			w_logf(ctx, LOG_DEBUG, "a1: " MAC_FMT " a2: " MAC_FMT " a3: " MAC_FMT " sq: %02x%02x r: " MAC_FMT" len: %d cookie: %lld\n", 
 					MAC_ARGS(hdr->addr1), MAC_ARGS(hdr->addr2), MAC_ARGS(hdr->addr3), (u32)hdr->seq_ctrl[0], (u32)hdr->seq_ctrl[1], 
@@ -1516,6 +1614,10 @@ void print_help(int exval)
 	printf("  -s              start the server on a socket\n");
 	printf("  -d              use the dynamic complex mode\n");
 	printf("                  (server only with matrices for each connection)\n");
+	printf("  -o FILE         redirect stdout/stderr to log file\n");
+	printf("  -R THRESH       set FPGA hardware RTS threshold (0-2347, default 2347=off)\n");
+	printf("                  written once at startup while idle; frames longer than\n");
+	printf("                  THRESH use hardware RTS/CTS\n");
 
 	exit(exval);
 }
@@ -1554,10 +1656,12 @@ static void realemu_rx_event_callback(int fd, short what, void *data)
 	while (realemu_handle_rx_queue(ctx->realemu_device, &macevent) > 0) {
 		cookie = macevent.mpduDigest.mpducacheaddr;
 		processed++;
-		w_logf(ctx, LOG_NOTICE, "[RX] Got frame from hardware: cookie=%llu, src=%d, dst=%d\n",
-		       (unsigned long long)cookie, macevent.srcMacId, macevent.dstMacId);
+		w_logf(ctx, LOG_NOTICE, "[RX] Got frame from hardware: cookie=%llu, src=%d, dst=%d, status=%u\n",
+		       (unsigned long long)cookie, macevent.srcMacId, macevent.dstMacId,
+		       (unsigned)macevent.status);
 
-		frame = dequeue_frame_by_cookie(ctx, cookie);
+		frame = dequeue_frame_by_cookie(ctx, cookie,
+						(int)macevent.srcMacId);
 		if (!frame) {
 			w_logf(ctx, LOG_ERR, "[RX] ERROR: No pending frame for cookie=%llu (frame may have timed out)\n",
 			       (unsigned long long)cookie);
@@ -1566,7 +1670,18 @@ static void realemu_rx_event_callback(int fd, short what, void *data)
 
 		w_logf(ctx, LOG_NOTICE, "[RX] Found matching frame (cookie=%llu), completing...\n",
 		       (unsigned long long)cookie);
-		complete_unicast_hw_success(ctx, frame);
+		if (macevent.status == 1) {
+			complete_unicast_hw_success(ctx, frame);
+		} else {
+			/* Hardware reported failure: no ACK, report the full
+			 * planned retry chain as attempted and failed. */
+			frame->flags &= ~HWSIM_TX_STAT_ACK;
+			w_logf(ctx, LOG_NOTICE, "[RX] Frame cookie=%llu FAILED (status=%u), reporting no-ack\n",
+			       (unsigned long long)cookie,
+			       (unsigned)macevent.status);
+			send_tx_info_frame(ctx, frame);
+			free(frame);
+		}
 		rearm_timer(ctx);
 	}
 
@@ -1640,7 +1755,7 @@ int main(int argc, char *argv[])
 	bool start_server = false;
 	bool full_dynamic = false;
 
-	while ((opt = getopt(argc, argv, "hVc:l:x:sda:o:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVc:l:x:sda:o:R:")) != -1) {
 		switch (opt) {
 		case 'h':
 			print_help(EXIT_SUCCESS);
@@ -1677,6 +1792,15 @@ int main(int argc, char *argv[])
 		case 'o':
 			/* redirect stdout/stderr to specified log file */
 			log_output = optarg;
+			break;
+		case 'R':
+			fpga_rts_thresh = atoi(optarg);
+			if (fpga_rts_thresh < 0 || fpga_rts_thresh > 2347) {
+				fprintf(stderr, "realwmediumd: invalid RTS threshold %d (0-2347)\n",
+					fpga_rts_thresh);
+				exit(EXIT_FAILURE);
+			}
+			printf("FPGA hardware RTS_THRESH fixed at %d\n", fpga_rts_thresh);
 			break;
 		case 'd':
 			full_dynamic = true;
@@ -1739,6 +1863,9 @@ int main(int argc, char *argv[])
 		w_logf(&ctx, LOG_ERR, "Failed to sync initial topology to hardware\n");
 		return EXIT_FAILURE;
 	}
+
+	/* RTS 阈值: 按 -R 启动参数在空闲期写一次, 数据路径不再改 (防 FPGA 挂死) */
+	set_fpga_rts(&ctx, fpga_rts_thresh);
 
 	/* init netlink */
 	if (init_netlink(&ctx) < 0)

@@ -1113,17 +1113,15 @@ static void* rx_polling_thread(void *arg) {
     printf("RX 轮询线程启动\n");
 
     while (realemu_device->rx_poll_running) {
-        // 轮询 C2H 通道，读取硬件数据到 RX 队列
-        int data_count = realemu_rx_poll(realemu_device);
-
-        if (data_count > 0) {
-            // 有数据到达，通知外部模块
+        /* 阻塞式读 C2H: 无数据时挂起等待(零 CPU), 读到一帧立即通知.
+         * 注意 XDMA 2020.2.2 驱动的流式 read 不支持 O_NONBLOCK, 必须阻塞打开;
+         * 旧实现每 1ms 只读 1 帧且 eventfd 只在整轮结束后写一次,
+         * 回传上限 1000 帧/s, 是 host 侧带宽瓶颈 */
+        int r = realemu_rx_poll(realemu_device);
+        if (r > 0) {
             uint64_t u = 1;
             write(realemu_device->rx_eventfd, &u, sizeof(u));
         }
-
-        // 1ms 轮询间隔
-        usleep(1000);
     }
 
     printf("RX 轮询线程退出\n");

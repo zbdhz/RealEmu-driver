@@ -102,6 +102,7 @@ enum {
 	HWSIM_ATTR_NO_VIF,
 	HWSIM_ATTR_FREQ,
 	HWSIM_ATTR_PAD,
+	HWSIM_ATTR_TX_INFO_FLAGS,	/* v5.15+: per-rate hwsim RC flags */
 	__HWSIM_ATTR_MAX,
 };
 #define HWSIM_ATTR_MAX (__HWSIM_ATTR_MAX - 1)
@@ -158,6 +159,20 @@ struct hwsim_tx_rate {
 	unsigned char count;
 };
 
+/* hwsim tx rate flag structure (kernel mac80211_hwsim.h, TX_INFO_FLAGS attr) */
+struct hwsim_tx_rate_flag {
+	signed char idx;
+	uint16_t flags;
+} __attribute__((packed));
+
+#ifndef BIT
+#define BIT(x) (1U << (x))
+#endif
+
+/* MAC80211_HWSIM_TX_RC_* flag bits (kernel mac80211_hwsim.h enum) */
+#define HWSIM_TX_RC_USE_RTS_CTS		BIT(0)
+#define HWSIM_TX_RC_USE_CTS_PROTECT	BIT(1)
+
 /* frame structure - represents a wireless frame in the simulation */
 struct frame {
 	struct list_head list;		/* frame queue list */
@@ -169,6 +184,7 @@ struct frame {
 	int signal;
 	int duration;
 	int tx_rates_count;
+	uint16_t tx_rate_flags[IEEE80211_TX_MAX_RATES]; /* per-rate hwsim RC flags */
 	struct station *sender;
 	struct hwsim_tx_rate tx_rates[IEEE80211_TX_MAX_RATES];
 	size_t data_len;
